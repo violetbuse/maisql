@@ -2,4 +2,4 @@
 
 resolver = "2"
 
-members = ["crates/cluster", "crates/maisql", "crates/raft", "crates/transport"]
+members = ["crates/maisql"]

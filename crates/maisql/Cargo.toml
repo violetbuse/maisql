@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = { version = "*" }
+async-trait = { version = "*" }
+futures = { version = "*" }
+serde = { version = "*", features = ["derive"] }
+rand = { version = "*" }
+tokio = { version = "*", features = ["full"] }
+serde_json = { version = "*" }
+rmp-serde = { version = "*" }
