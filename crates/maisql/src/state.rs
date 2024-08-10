@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::Hash,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -18,6 +18,7 @@ pub struct NodeId {
 pub struct Config {
     pub local_node_id: NodeId,
     pub cluster_config: ClusterConfig,
+    pub raft_config: RaftConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -30,56 +31,29 @@ pub struct ClusterConfig {
     pub nodes_to_ping: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct RaftConfig {
+    pub heartbeat_interval: Duration,
+    pub tick_interval: Duration,
+    pub min_election_timeout: Duration,
+    pub max_election_timeout: Duration,
+    pub term_cleanup: u64,
+    pub leader_heartbeat_cleanup: Duration,
+    /// Value between 0 and 1
+    pub min_vote_ratio_to_lead: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct State {
     pub nodes: HashMap<NodeId, Node>,
     pub local_node: (NodeId, Node),
+    pub raft_terms: HashMap<u64, TermData>,
 }
 
 pub type ClusterDigest = HashMap<NodeId, u64>;
 pub type ClusterDelta = HashMap<NodeId, ClusterData>;
 
-impl State {
-    pub fn generate_cluster_digest(&self) -> ClusterDigest {
-        return self
-            .nodes
-            .clone()
-            .into_iter()
-            .filter_map(|(id, value)| {
-                if id == self.local_node.0 {
-                    return None;
-                } else {
-                    return Some((id, value.cluster.version));
-                }
-            })
-            .collect();
-    }
-    pub fn generate_cluster_delta(&self, digest: ClusterDigest) -> ClusterDelta {
-        return self
-            .nodes
-            .clone()
-            .into_iter()
-            .filter_map(|(id, value)| match digest.get(&id) {
-                None => Some((id, value.cluster)),
-                Some(digest_version) if digest_version < &value.cluster.version => {
-                    Some((id, value.cluster))
-                }
-                _ => None,
-            })
-            .collect();
-    }
-    pub fn apply_cluster_delta(&mut self, delta: ClusterDelta) {
-        for (id, node) in delta.iter() {
-            self.nodes
-                .entry(id.clone())
-                .and_modify(|node_data| node_data.cluster = node.clone())
-                .or_insert(Node {
-                    cluster: node.clone(),
-                    raft: RaftData::default(),
-                });
-        }
-    }
-}
+impl State {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -107,8 +81,35 @@ impl ClusterData {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RaftData {}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaftData {
+    pub member: bool,
+}
+
+impl Default for RaftData {
+    fn default() -> Self {
+        Self { member: false }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TermData {
+    pub leader: Option<NodeId>,
+    pub leader_heartbeats: Vec<SystemTime>,
+    pub voted_for: Option<NodeId>,
+    pub votes_received: HashSet<NodeId>,
+}
+
+impl Default for TermData {
+    fn default() -> Self {
+        Self {
+            leader: None,
+            leader_heartbeats: Vec::new(),
+            voted_for: None,
+            votes_received: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Global {

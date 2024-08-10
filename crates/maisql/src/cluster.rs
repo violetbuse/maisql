@@ -1,13 +1,12 @@
-use crate::state::{ClusterDelta, ClusterDigest, Global, NodeId};
-use crate::transport::Transport;
-use anyhow::anyhow;
+use crate::state::{ClusterDelta, ClusterDigest, Global, Node, NodeId, RaftData, State};
+use crate::transport::{Transport, TransportData};
 use futures::future;
 use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, time::SystemTime};
 use tokio::time::{self, Instant};
 
-pub async fn run_node(transport: impl Transport, global: &Global) -> anyhow::Result<()> {
+pub async fn run_node(transport: &impl Transport, global: &Global) -> anyhow::Result<()> {
     let mut interval = time::interval(global.config.cluster_config.cluster_heartbeat);
 
     loop {
@@ -19,8 +18,8 @@ pub async fn run_node(transport: impl Transport, global: &Global) -> anyhow::Res
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "cluster_transport_message")]
-pub enum TransportMessage {
+#[serde(tag = "cluster_msg_type")]
+pub enum ClusterMessage {
     Syn {
         cluster_digest: ClusterDigest,
     },
@@ -39,38 +38,60 @@ pub enum TransportMessage {
     },
 }
 
-impl TransportMessage {
-    pub fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
-        if let Ok(parsed) = rmp_serde::from_slice(bytes) {
-            Ok(parsed)
-        } else if let Ok(parsed) = serde_json::from_slice(bytes) {
-            Ok(parsed)
-        } else {
-            return Err(anyhow!(
-                "Could not parse node_cluster message from msgpack or json."
-            ));
+impl TransportData for ClusterMessage {}
+
+impl State {
+    pub fn generate_cluster_digest(&self) -> ClusterDigest {
+        return self
+            .nodes
+            .clone()
+            .into_iter()
+            .filter_map(|(id, value)| {
+                if id == self.local_node.0 {
+                    return None;
+                } else {
+                    return Some((id, value.cluster.version));
+                }
+            })
+            .collect();
+    }
+    pub fn generate_cluster_delta(&self, digest: ClusterDigest) -> ClusterDelta {
+        return self
+            .nodes
+            .clone()
+            .into_iter()
+            .filter_map(|(id, value)| match digest.get(&id) {
+                None => Some((id, value.cluster)),
+                Some(digest_version) if digest_version < &value.cluster.version => {
+                    Some((id, value.cluster))
+                }
+                _ => None,
+            })
+            .collect();
+    }
+    pub fn apply_cluster_delta(&mut self, delta: ClusterDelta) {
+        for (id, node) in delta.iter() {
+            self.nodes
+                .entry(id.clone())
+                .and_modify(|node_data| node_data.cluster = node.clone())
+                .or_insert(Node {
+                    cluster: node.clone(),
+                    raft: RaftData::default(),
+                });
         }
-    }
-    pub fn serialize_msgpack(&self) -> anyhow::Result<Vec<u8>> {
-        rmp_serde::to_vec(self)
-            .map_err(|_| anyhow!("Could not serialize node_cluster message to msgpack."))
-    }
-    pub fn serialize_json(&self) -> anyhow::Result<Vec<u8>> {
-        serde_json::to_vec_pretty(self)
-            .map_err(|_| anyhow!("Could not serialize node_cluster message to json."))
     }
 }
 
 async fn handle_transport_message(
     bytes: &[u8],
     from: NodeId,
-    transport: impl Transport,
+    transport: &impl Transport,
     global: &Global,
 ) -> anyhow::Result<()> {
-    let message = TransportMessage::parse(bytes)?;
+    let message = ClusterMessage::parse(bytes, "cluster_message")?;
 
     match message {
-        TransportMessage::Syn { cluster_digest } => {
+        ClusterMessage::Syn { cluster_digest } => {
             let (cluster_delta, cluster_digest) = global.map_state(|state| {
                 (
                     state.generate_cluster_delta(cluster_digest.clone()),
@@ -78,15 +99,16 @@ async fn handle_transport_message(
                 )
             });
 
-            let message = TransportMessage::SynAck {
+            let message = ClusterMessage::SynAck {
                 cluster_digest,
                 cluster_delta,
-            }
-            .serialize_msgpack()?;
+            };
 
-            transport.send_unreliable(from, &message).await?;
+            let data = TransportData::serialize(&message);
+
+            transport.send_unreliable(from, &data).await?;
         }
-        TransportMessage::SynAck {
+        ClusterMessage::SynAck {
             cluster_digest,
             cluster_delta,
         } => {
@@ -95,21 +117,23 @@ async fn handle_transport_message(
                 state.generate_cluster_delta(cluster_digest.clone())
             });
 
-            let message = TransportMessage::Ack { cluster_delta }.serialize_msgpack()?;
+            let message = ClusterMessage::Ack { cluster_delta };
 
-            transport.send_unreliable(from, &message).await?;
+            let data = TransportData::serialize(&message);
+
+            transport.send_unreliable(from, &data).await?;
         }
-        TransportMessage::Ack { cluster_delta } => {
+        ClusterMessage::Ack { cluster_delta } => {
             global.map_state_mut(|state| state.apply_cluster_delta(cluster_delta.clone()))
         }
-        TransportMessage::DecomissionNode { addr } => global.map_state_mut(|state| {
+        ClusterMessage::DecomissionNode { addr } => global.map_state_mut(|state| {
             state.nodes.entry(addr.clone()).and_modify(|node| {
                 node.cluster.map(|cluster_data| {
                     cluster_data.deleted = true;
                 })
             });
         }),
-        TransportMessage::RejoinNode { addr } => global.map_state_mut(|state| {
+        ClusterMessage::RejoinNode { addr } => global.map_state_mut(|state| {
             state.nodes.entry(addr.clone()).and_modify(|node| {
                 node.cluster.map(|cluster_data| {
                     cluster_data.deleted = false;
@@ -123,7 +147,7 @@ async fn handle_transport_message(
 
 async fn handle_heartbeat(
     _when: Instant,
-    transport: impl Transport,
+    transport: &impl Transport,
     global: &Global,
 ) -> anyhow::Result<()> {
     let messages: Vec<(NodeId, Vec<u8>)> = global.map_state_mut(|state| {
@@ -171,11 +195,12 @@ async fn handle_heartbeat(
         return nodes
             .iter()
             .map(|nodeid| {
-                let data = TransportMessage::Syn {
+                let message = ClusterMessage::Syn {
                     cluster_digest: digest.clone(),
-                }
-                .serialize_msgpack()
-                .unwrap();
+                };
+
+                let data = TransportData::serialize(&message);
+
                 (nodeid.clone(), data)
             })
             .collect();
@@ -184,8 +209,7 @@ async fn handle_heartbeat(
     future::join_all(
         messages
             .iter()
-            .map(|(addr, data)| transport.send_unreliable(addr.clone(), data))
-            .collect::<Vec<_>>(),
+            .map(|(addr, data)| transport.send_unreliable(addr.clone(), data)),
     )
     .await;
 
