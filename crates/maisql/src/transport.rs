@@ -1,9 +1,15 @@
-use crate::state::NodeId;
 use std::{env, time::Duration};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeId {
+    pub hostname: String,
+    pub port: usize,
+    pub name: String,
+}
 
 #[async_trait]
 pub trait ResponseHandle: Send + Sync {
@@ -37,7 +43,7 @@ pub trait TransportData: Serialize + for<'a> Deserialize<'a> {
     /// if $DEBUG = true or 0 use json, otherwise use $MAISQL_SERIALIZE_FMT
     /// where valid values are "json" and "msgpack". if no valid values, fallback
     /// to msgpack.
-    fn serialize(&self) -> Vec<u8> {
+    fn serialize_for_send(&self) -> Vec<u8> {
         let debug = env::var("DEBUG")
             .map(|debug_val| debug_val.as_str() == "true" || debug_val.as_str() == "1")
             .unwrap_or(false);

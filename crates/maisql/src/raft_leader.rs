@@ -3,44 +3,82 @@ use std::time::{Duration, SystemTime};
 use futures::future;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::time::{self, Instant};
+use tokio::{
+    sync::{broadcast, mpsc, oneshot},
+    time::{self, Instant},
+};
 
 use crate::{
-    state::{Global, NodeId, State, TermData},
+    config::Config,
     transport::{RequestHandle, Transport, TransportData},
 };
 
-pub async fn run_raft(transport: &impl Transport, global: &Global) -> anyhow::Result<()> {
+#[derive(Debug, Clone)]
+pub struct RaftConfig {
+    /// Does this node participate in raft
+    pub raft_voter: bool,
+    /// Must be the lowest interval
+    pub tick_interval: Duration,
+    /// Recommended to be anywhere between 1/5 and 1/2 of the min election timeout.
+    /// Lower is better.
+    pub heartbeat_interval: Duration,
+    pub min_election_timeout: Duration,
+    pub max_election_timeout: Duration,
+    /// How many terms need to pass before one is cleaned up
+    pub term_cleanup: u64,
+    /// How long to wait before removing heartbeat entries from memory
+    pub leader_heartbeat_cleanup: Duration,
+    /// Value between 0 and 1
+    pub min_vote_ratio_to_lead: f64,
+}
+
+struct State {}
+
+pub async fn run_raft(
+    transport: &impl Transport,
+    config: &mut broadcast::Receiver<Config>,
+    client_sender: oneshot::Sender<RaftClient>,
+) -> anyhow::Result<()> {
+    let (client, mut client_rx) = RaftClient::new();
+    client_sender.send(client).unwrap();
+
+    let config = config.recv().await.unwrap();
+
     let mut rng = rand::thread_rng();
 
+    let state = State {};
+
     let election_timeout = rng.gen_range(
-        global.config.raft_config.min_election_timeout
-            ..global.config.raft_config.max_election_timeout,
+        config.raft_config.min_election_timeout..config.raft_config.max_election_timeout,
     );
 
     let mut election_timeout_interval = time::interval(election_timeout);
-    let mut heartbeat_interval = time::interval(global.config.raft_config.heartbeat_interval);
-    let mut tick_interval = time::interval(global.config.raft_config.tick_interval);
+    let mut heartbeat_interval = time::interval(config.raft_config.heartbeat_interval);
+    let mut tick_interval = time::interval(config.raft_config.tick_interval);
 
     loop {
         let _ = tokio::select! {
-            _instant = election_timeout_interval.tick() => handle_election_timeout(election_timeout, transport, global).await,
-                _instant = tick_interval.tick() => handle_tick(transport, global).await,
-            instant = heartbeat_interval.tick() => handle_own_heartbeat(instant, transport, global).await,
-            Some((bytes, from)) = transport.recv() => handle_transport_message(bytes, from, transport, global).await,
-            Some(req) = transport.recv_request() => handle_transport_request(req, transport, global).await
+            _instant = election_timeout_interval.tick() => handle_election_timeout(election_timeout, transport, config.to_owned(), &mut state).await,
+            _instant = tick_interval.tick() => handle_tick(transport, config.to_owned(), &mut state).await,
+            instant = heartbeat_interval.tick() => handle_own_heartbeat(instant, transport, config.to_owned(), &mut state).await,
+            Some(req) = client_rx.recv() => handle_raft_client_request(req, transport, config.to_owned(), &mut state).await,
+            Some((bytes, from)) = transport.recv() => handle_transport_message(bytes, from, transport, config.to_owned(), &mut state).await,
         };
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "raft_msg_type")]
+#[serde(tag = "raft_msg")]
 pub enum RaftMessage {
     LeaderHeartbeat { term: u64 },
     MemberHeartbeat,
     AnnounceCandidacy { term: u64 },
     CommitVote { term: u64 },
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "resource_lock_type")]
+pub enum Resource {}
 
 impl TransportData for RaftMessage {}
 
@@ -111,7 +149,8 @@ async fn handle_transport_message(
     bytes: &[u8],
     from: NodeId,
     transport: &impl Transport,
-    global: &Global,
+    config: Config,
+    state: &mut State,
 ) -> anyhow::Result<()> {
     let message = RaftMessage::parse(bytes, "raft_message")?;
 
@@ -146,24 +185,11 @@ async fn handle_transport_message(
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "raft_req_type")]
-pub enum RaftRequest {}
-
-impl TransportData for RaftRequest {}
-
-async fn handle_transport_request(
-    req: &impl RequestHandle,
+async fn handle_tick(
     _transport: &impl Transport,
-    _global: &Global,
+    config: Config,
+    state: &mut State,
 ) -> anyhow::Result<()> {
-    let (data, _from) = req.data();
-    let _request = RaftRequest::parse(data, "raft_request");
-
-    Ok(())
-}
-
-async fn handle_tick(_transport: &impl Transport, global: &Global) -> anyhow::Result<()> {
     let current_term = global.map_state(|state| state.current_raft_term());
 
     // do some cleanup first
@@ -208,7 +234,8 @@ async fn handle_tick(_transport: &impl Transport, global: &Global) -> anyhow::Re
 async fn handle_own_heartbeat(
     _instant: Instant,
     transport: &impl Transport,
-    global: &Global,
+    config: Config,
+    state: &mut State,
 ) -> anyhow::Result<()> {
     let current_term = global.map_state(|state| state.current_raft_term());
     let current_leader = global.map_state(|state| state.current_raft_leader());
@@ -236,7 +263,8 @@ async fn handle_own_heartbeat(
 async fn handle_election_timeout(
     election_timeout: Duration,
     transport: &impl Transport,
-    global: &Global,
+    config: Config,
+    state: &mut State,
 ) -> anyhow::Result<()> {
     let current_term = global.map_state(|state| state.current_raft_term());
 
@@ -297,4 +325,27 @@ async fn handle_election_timeout(
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+pub enum RaftClientRequest {}
+
+#[derive(Debug, Clone)]
+pub struct RaftClient {
+    sender: mpsc::Sender<RaftClientRequest>,
+}
+
+impl RaftClient {
+    pub fn new() -> (Self, mpsc::Receiver<RaftClientRequest>) {
+        let (tx, rx) = mpsc::channel(128);
+        return (Self { sender: tx }, rx);
+    }
+}
+
+async fn handle_raft_client_request(
+    req: RaftClientRequest,
+    transport: &impl Transport,
+    config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
 }
