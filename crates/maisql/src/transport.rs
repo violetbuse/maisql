@@ -19,7 +19,7 @@ pub trait ResponseHandle: Send + Sync {
 pub trait RequestHandle: Send + Sync + Clone + Copy {
     fn data(&self) -> (&[u8], NodeId);
     /// Returns `Ok(response_handle)` if no other function has accepted yet.
-    fn accept(&self) -> anyhow::Result<&impl ResponseHandle>;
+    fn accept(&self) -> anyhow::Result<impl ResponseHandle>;
 }
 
 #[async_trait]

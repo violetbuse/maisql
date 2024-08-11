@@ -1,6 +1,7 @@
-use std::time::{Duration, SystemTime};
+use std::{collections::HashSet, time::Duration};
 
-use futures::future;
+use anyhow::anyhow;
+use futures::future::join_all;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -10,29 +11,29 @@ use tokio::{
 
 use crate::{
     config::Config,
-    transport::{RequestHandle, Transport, TransportData},
+    transport::{NodeId, RequestHandle, ResponseHandle, Transport, TransportData},
 };
 
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
     /// Does this node participate in raft
     pub raft_voter: bool,
-    /// Must be the lowest interval
-    pub tick_interval: Duration,
-    /// Recommended to be anywhere between 1/5 and 1/2 of the min election timeout.
-    /// Lower is better.
     pub heartbeat_interval: Duration,
     pub min_election_timeout: Duration,
     pub max_election_timeout: Duration,
-    /// How many terms need to pass before one is cleaned up
-    pub term_cleanup: u64,
-    /// How long to wait before removing heartbeat entries from memory
-    pub leader_heartbeat_cleanup: Duration,
-    /// Value between 0 and 1
-    pub min_vote_ratio_to_lead: f64,
 }
 
-struct State {}
+struct State {
+    term: Term,
+}
+
+struct Term {
+    id: u64,
+    leader: Option<NodeId>,
+    voted: bool,
+    votes_received: HashSet<NodeId>,
+    last_leader_heartbeat: Option<Instant>,
+}
 
 pub async fn run_raft(
     transport: &impl Transport,
@@ -40,30 +41,42 @@ pub async fn run_raft(
     client_sender: oneshot::Sender<RaftClient>,
 ) -> anyhow::Result<()> {
     let (client, mut client_rx) = RaftClient::new();
-    client_sender.send(client).unwrap();
+    client_sender.send(client);
 
     let config = config.recv().await.unwrap();
-
     let mut rng = rand::thread_rng();
-
-    let state = State {};
-
     let election_timeout = rng.gen_range(
         config.raft_config.min_election_timeout..config.raft_config.max_election_timeout,
     );
 
     let mut election_timeout_interval = time::interval(election_timeout);
     let mut heartbeat_interval = time::interval(config.raft_config.heartbeat_interval);
-    let mut tick_interval = time::interval(config.raft_config.tick_interval);
 
-    loop {
-        let _ = tokio::select! {
-            _instant = election_timeout_interval.tick() => handle_election_timeout(election_timeout, transport, config.to_owned(), &mut state).await,
-            _instant = tick_interval.tick() => handle_tick(transport, config.to_owned(), &mut state).await,
-            instant = heartbeat_interval.tick() => handle_own_heartbeat(instant, transport, config.to_owned(), &mut state).await,
-            Some(req) = client_rx.recv() => handle_raft_client_request(req, transport, config.to_owned(), &mut state).await,
-            Some((bytes, from)) = transport.recv() => handle_transport_message(bytes, from, transport, config.to_owned(), &mut state).await,
-        };
+    let mut state = State {
+        term: Term {
+            id: 0,
+            leader: None,
+            voted: false,
+            votes_received: HashSet::new(),
+            last_leader_heartbeat: None,
+        },
+    };
+
+    if config.raft_config.raft_voter {
+        loop {
+            let _ = tokio::select! {
+                _ = election_timeout_interval.tick() => handle_election_timeout(election_timeout, transport, config.to_owned(), &mut state).await,
+                _ = heartbeat_interval.tick() => handle_own_heartbeat(transport, config.to_owned(), &mut state).await,
+                Some((bytes, from)) = transport.recv() => handle_transport_message(bytes, from, transport, config.to_owned(), &mut state).await,
+                Some(req) = client_rx.recv() => handle_raft_client_request(req, transport, config.to_owned(), &mut state).await,
+            };
+        }
+    } else {
+        loop {
+            let _ = tokio::select! {
+                Some(req) = client_rx.recv() => handle_raft_client_request(req, transport, config.to_owned(), &mut state).await
+            };
+        }
     }
 }
 
@@ -71,79 +84,12 @@ pub async fn run_raft(
 #[serde(tag = "raft_msg")]
 pub enum RaftMessage {
     LeaderHeartbeat { term: u64 },
-    MemberHeartbeat,
-    AnnounceCandidacy { term: u64 },
+    AnnounceLeadership { term: u64 },
+    AnnounceCandidate { term: u64 },
     CommitVote { term: u64 },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "resource_lock_type")]
-pub enum Resource {}
-
 impl TransportData for RaftMessage {}
-
-impl State {
-    pub fn register_raft_leader_heartbeat(&mut self, leader: NodeId, term: u64) {
-        self.raft_terms
-            .entry(term)
-            .and_modify(|term_data| {
-                match term_data.leader.clone() {
-                    None => {
-                        term_data.leader = Some(leader.clone());
-                        term_data.leader_heartbeats.push(SystemTime::now());
-                    }
-                    Some(curr_leader) if curr_leader == leader => {
-                        term_data.leader_heartbeats.push(SystemTime::now());
-                    }
-                    Some(_) => {}
-                };
-            })
-            .or_insert_with(|| {
-                let mut term = TermData::default();
-                term.leader = Some(leader);
-                term.leader_heartbeats.push(SystemTime::now());
-                return term;
-            });
-    }
-    pub fn handle_candidature_announcement(&mut self, candidate: NodeId, term: u64) -> bool {
-        let term_entry = self
-            .raft_terms
-            .entry(term)
-            .and_modify(|term_data| match term_data.voted_for.clone() {
-                None => term_data.voted_for = Some(candidate.clone()),
-                Some(_) => {}
-            })
-            .or_insert_with(|| {
-                let mut term = TermData::default();
-                term.voted_for = Some(candidate.clone());
-                return term;
-            });
-
-        return term_entry.voted_for == Some(candidate.clone());
-    }
-    pub fn handle_vote_commitment(&mut self, term: u64, from: NodeId) {
-        self.raft_terms.entry(term).and_modify(|term_data| {
-            term_data.votes_received.insert(from);
-        });
-    }
-    pub fn current_raft_term(&self) -> u64 {
-        let mut current_term = 0;
-        for (id, _) in self.raft_terms.clone() {
-            if current_term < id {
-                current_term = id;
-            }
-        }
-
-        return current_term;
-    }
-    pub fn current_raft_leader(&self) -> Option<NodeId> {
-        let current_term = self.current_raft_term();
-        self.raft_terms
-            .get(&current_term)
-            .map(|term_data| term_data.leader.clone())
-            .flatten()
-    }
-}
 
 async fn handle_transport_message(
     bytes: &[u8],
@@ -156,107 +102,137 @@ async fn handle_transport_message(
 
     match message {
         RaftMessage::LeaderHeartbeat { term } => {
-            global.map_state_mut(|state| state.register_raft_leader_heartbeat(from.clone(), term))
+            handle_leader_heartbeat(term, from, transport, config, state).await
         }
-        RaftMessage::MemberHeartbeat => {
-            global.map_state_mut(|state| {
-                state.nodes.entry(from.clone()).and_modify(|node_state| {
-                    node_state.raft.member = true;
-                });
-            });
+        RaftMessage::AnnounceLeadership { term } => {
+            handle_announce_leadership(term, from, transport, config, state).await
         }
-        RaftMessage::AnnounceCandidacy { term } => {
-            let voted_for_candidate = global.map_state_mut(|state| {
-                state.handle_candidature_announcement(from.clone(), term.clone())
-            });
-            if voted_for_candidate {
-                let message = RaftMessage::CommitVote { term };
-                let data = TransportData::serialize(&message);
-                transport.send_reliable(from, &data).await;
-            }
+        RaftMessage::AnnounceCandidate { term } => {
+            handle_announce_candidate(term, from, transport, config, state).await
         }
         RaftMessage::CommitVote { term } => {
-            global.map_state_mut(|state| {
-                state.handle_vote_commitment(term.clone(), from.clone());
-            });
+            handle_commit_vote(term, from, transport, config, state).await
         }
-    };
+    }
+}
+
+async fn handle_leader_heartbeat(
+    term: u64,
+    from: NodeId,
+    _transport: &impl Transport,
+    _config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    if term == state.term.id {
+        state.term.last_leader_heartbeat = Some(Instant::now());
+    } else if term > state.term.id {
+        state.term = Term {
+            id: term,
+            leader: Some(from),
+            voted: false,
+            votes_received: HashSet::new(),
+            last_leader_heartbeat: Some(Instant::now()),
+        };
+    }
 
     Ok(())
 }
 
-async fn handle_tick(
+async fn handle_announce_leadership(
+    term: u64,
+    from: NodeId,
     _transport: &impl Transport,
+    _config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    if term >= state.term.id {
+        state.term.last_leader_heartbeat = Some(Instant::now());
+        state.term.leader = Some(from);
+    }
+
+    Ok(())
+}
+
+async fn handle_announce_candidate(
+    term: u64,
+    from: NodeId,
+    transport: &impl Transport,
+    _config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    if term > state.term.id {
+        state.term = Term {
+            id: term,
+            leader: None,
+            voted: false,
+            votes_received: HashSet::new(),
+            last_leader_heartbeat: None,
+        };
+    }
+
+    if !state.term.voted {
+        state.term.voted = true;
+        let commit_msg = RaftMessage::CommitVote { term };
+
+        transport
+            .send_reliable(from, &commit_msg.serialize_for_send())
+            .await;
+    }
+
+    Ok(())
+}
+
+async fn handle_commit_vote(
+    term: u64,
+    from: NodeId,
+    transport: &impl Transport,
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
-    let current_term = global.map_state(|state| state.current_raft_term());
+    if term == state.term.id {
+        state.term.votes_received.insert(from);
+        let total_votes_received = state.term.votes_received.len();
+        let raft_nodes = config.cluster_client.list_raft_nodes().await?;
+        let raft_node_count = raft_nodes.len();
 
-    // do some cleanup first
-    global.map_state_mut(|state| {
-        state
-            .raft_terms
-            .retain(|k, _v| *k > current_term - global.config.raft_config.term_cleanup);
+        let vote_percentage = total_votes_received as f64 / raft_node_count as f64;
 
-        let heartbeat_cleanup_cutoff =
-            SystemTime::now().checked_sub(global.config.raft_config.leader_heartbeat_cleanup);
-
-        for (_, term) in state.raft_terms.iter_mut() {
-            term.leader_heartbeats.retain(|heartbeat| {
-                heartbeat_cleanup_cutoff
-                    .clone()
-                    .map(|cutoff| heartbeat.gt(&cutoff))
-                    .unwrap_or(true)
-            });
+        if vote_percentage > 0.5 {
+            state.term.leader = Some(config.cluster_config.own_node_id);
+            let message = RaftMessage::AnnounceLeadership { term };
+            let serialized = message.serialize_for_send();
+            join_all(
+                raft_nodes
+                    .iter()
+                    .map(|node| transport.send_reliable(node.to_owned(), &serialized.as_slice())),
+            );
         }
-    });
-
-    // confirm leadership
-    global.map_state_mut(|state| {
-        let node_count = state.nodes.keys().count();
-
-        state
-            .raft_terms
-            .entry(current_term)
-            .and_modify(|term_data| {
-                let vote_count = term_data.votes_received.len();
-                let ratio = vote_count as f64 / node_count as f64;
-
-                if ratio > global.config.raft_config.min_vote_ratio_to_lead {
-                    term_data.leader = Some(state.local_node.0.to_owned());
-                }
-            });
-    });
+    }
 
     Ok(())
 }
 
 async fn handle_own_heartbeat(
-    _instant: Instant,
     transport: &impl Transport,
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
-    let current_term = global.map_state(|state| state.current_raft_term());
-    let current_leader = global.map_state(|state| state.current_raft_leader());
+    let local_is_leader = state.term.leader == Some(config.cluster_config.own_node_id);
 
-    let is_current_leader = current_leader
-        .map(|leader| leader == global.config.local_node_id)
-        .unwrap_or(false);
+    if local_is_leader {
+        let raft_nodes = config.cluster_client.list_raft_nodes().await?;
+        let message = RaftMessage::LeaderHeartbeat {
+            term: state.term.id,
+        };
+        let serialized = message.serialize_for_send();
 
-    let heartbeat_message = match is_current_leader {
-        false => RaftMessage::MemberHeartbeat,
-        true => RaftMessage::LeaderHeartbeat { term: current_term },
-    };
+        join_all(
+            raft_nodes
+                .iter()
+                .map(|node| transport.send_reliable(node.to_owned(), &serialized)),
+        );
+    }
 
-    let heartbeat_data = TransportData::serialize(&heartbeat_message);
-    let nodes: Vec<_> = global.map_state(|state| state.nodes.keys().cloned().collect());
-
-    let _ = future::join_all(
-        nodes
-            .iter()
-            .map(|node_id| transport.send_reliable(node_id.clone(), &heartbeat_data)),
-    );
     Ok(())
 }
 
@@ -266,69 +242,95 @@ async fn handle_election_timeout(
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
-    let current_term = global.map_state(|state| state.current_raft_term());
+    let elapsed_since_hb = state
+        .term
+        .last_leader_heartbeat
+        .map(|hb| Instant::now().duration_since(hb))
+        .unwrap_or(
+            election_timeout
+                .checked_add(Duration::from_secs(5))
+                .unwrap(),
+        );
 
-    let received_leader_heartbeat = global.map_state(|state| -> bool {
-        let is_current_leader = state.current_raft_leader() == Some(state.local_node.0.clone());
+    let leader_exists_but_died =
+        state.term.leader.is_some() && elapsed_since_hb.gt(&election_timeout);
 
-        if is_current_leader {
-            return true;
-        }
+    let should_become_candidate = leader_exists_but_died && state.term.voted == false;
 
-        let current_term = state.current_raft_term();
-        let term = state.raft_terms.get(&current_term);
-
-        let heartbeats_in_interval = term
-            .map(|term| {
-                term.leader_heartbeats
-                    .iter()
-                    .filter(|hb| {
-                        SystemTime::now()
-                            .duration_since(**hb)
-                            .map(|diff| diff.gt(&election_timeout))
-                            .unwrap_or(false)
-                    })
-                    .count()
-                    > 0
-            })
-            .unwrap_or(false);
-
-        return heartbeats_in_interval;
-    });
-
-    if !received_leader_heartbeat {
-        let nodes = global.map_state_mut(|state| {
-            state
-                .raft_terms
-                .insert(current_term + 1, TermData::default());
-
-            return state
-                .nodes
-                .iter()
-                .map(|(node_id, _)| node_id.clone())
-                .collect::<Vec<_>>();
-        });
-
-        let candidacy = RaftMessage::AnnounceCandidacy {
-            term: current_term + 1,
+    if should_become_candidate {
+        state.term = Term {
+            id: state.term.id + 1,
+            leader: None,
+            voted: false,
+            votes_received: HashSet::new(),
+            last_leader_heartbeat: None,
         };
-        let data = TransportData::serialize(&candidacy);
 
-        let mut messages: Vec<_> = Vec::new();
+        state.term.voted = true;
+        state
+            .term
+            .votes_received
+            .insert(config.cluster_config.own_node_id.clone());
 
-        for node in nodes {
-            let msg = transport.send_reliable(node, &data);
-            messages.push(msg);
+        let raft_nodes = config.cluster_client.list_raft_nodes().await?;
+        let raft_node_count = raft_nodes.len();
+
+        if raft_node_count == 1 {
+            state.term.leader = Some(config.cluster_config.own_node_id.clone());
+        } else {
+            let announcement = RaftMessage::AnnounceCandidate {
+                term: state.term.id,
+            };
+            let serialized = announcement.serialize_for_send();
+
+            join_all(
+                raft_nodes
+                    .iter()
+                    .map(|node| transport.send_reliable(node.to_owned(), &serialized)),
+            );
         }
+    }
 
-        future::join_all(messages);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "raft_network_req")]
+pub enum RaftNetworkRequest {
+    LeaderQuery,
+}
+
+impl TransportData for RaftNetworkRequest {}
+
+async fn handle_raft_network_req(
+    req: &impl RequestHandle,
+    _transport: &impl Transport,
+    _config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    let (data, _) = req.data();
+    let data = RaftNetworkRequest::parse(&data, "raft_network_request")?;
+
+    let res = req.accept()?;
+
+    match data {
+        RaftNetworkRequest::LeaderQuery => {
+            let leader = state.term.leader.to_owned();
+            let serialized = rmp_serde::to_vec(&leader)?;
+
+            res.send_response(&serialized);
+        }
     }
 
     Ok(())
 }
 
 #[derive(Debug)]
-pub enum RaftClientRequest {}
+pub enum RaftClientRequest {
+    QueryLeader {
+        response: oneshot::Sender<Result<Option<NodeId>, ()>>,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct RaftClient {
@@ -340,6 +342,14 @@ impl RaftClient {
         let (tx, rx) = mpsc::channel(128);
         return (Self { sender: tx }, rx);
     }
+    pub async fn leader(&self) -> anyhow::Result<Option<NodeId>> {
+        let (tx, rx) = oneshot::channel();
+        let req = RaftClientRequest::QueryLeader { response: tx };
+        self.sender.send(req).await?;
+
+        let response = rx.await?;
+        response.map_err(|_| anyhow!("Could not determine raft cluster leader"))
+    }
 }
 
 async fn handle_raft_client_request(
@@ -348,4 +358,48 @@ async fn handle_raft_client_request(
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
+    match req {
+        RaftClientRequest::QueryLeader { response } => {
+            handle_leader_query(response, transport, config, state).await
+        }
+    }
+}
+
+async fn handle_leader_query(
+    channel: oneshot::Sender<Result<Option<NodeId>, ()>>,
+    transport: &impl Transport,
+    config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    let leader: Result<Option<NodeId>, ()> = match config.raft_config.raft_voter {
+        true => Ok(state.term.leader.to_owned()),
+        false => {
+            let node = config
+                .cluster_client
+                .list_raft_nodes()
+                .await
+                .ok()
+                .map(|vec| vec.first().map(|node| node.to_owned()))
+                .flatten()
+                .map(|node| node.clone());
+
+            match node {
+                None => Err(()),
+                Some(node) => {
+                    let req = RaftNetworkRequest::LeaderQuery.serialize_for_send();
+                    let res = transport
+                        .send_request(node, &req, Duration::from_millis(1500))
+                        .await;
+
+                    res.ok()
+                        .map(|bytes| rmp_serde::from_slice::<Option<NodeId>>(&bytes).ok())
+                        .flatten()
+                        .ok_or(())
+                }
+            }
+        }
+    };
+
+    channel.send(leader).unwrap();
+    Ok(())
 }
