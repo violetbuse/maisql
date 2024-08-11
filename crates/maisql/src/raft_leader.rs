@@ -350,6 +350,14 @@ impl RaftClient {
         let response = rx.await?;
         response.map_err(|_| anyhow!("Could not determine raft cluster leader"))
     }
+    pub async fn self_is_leader(&self, config: Config) -> anyhow::Result<bool> {
+        let leader = self.leader().await?;
+        let leader_is_self = leader
+            .map(|leader| leader == config.cluster_config.own_node_id)
+            .unwrap_or(false);
+
+        Ok(leader_is_self)
+    }
 }
 
 async fn handle_raft_client_request(
