@@ -6,7 +6,7 @@ use tokio::{
 use crate::{
     cluster::{self, ClusterConfig},
     config::Config,
-    raft_leader::{self, RaftConfig},
+    raft::{self, RaftConfig},
     semaphore::{self, SemaphoreConfig},
     transport::Transport,
 };
@@ -24,18 +24,14 @@ pub async fn start_node(transport: &impl Transport, config: ManagerConfig) {
     let (raft_client_sender, raft_client_recv) = oneshot::channel();
     let (semaphore_client_sender, semaphore_client_recv) = oneshot::channel();
 
-    let cluster_task = cluster::run_node(
-        transport,
-        &mut cfg_recv.resubscribe(),
-        cluster_client_sender,
-    );
-    let raft_task =
-        raft_leader::run_raft(transport, &mut cfg_recv.resubscribe(), raft_client_sender);
-    let semaphore_task = semaphore::run_semaphore(
-        transport,
-        &mut cfg_recv.resubscribe(),
-        semaphore_client_sender,
-    );
+    let mut cluster_cfg_recv = cfg_recv.resubscribe();
+    let mut raft_cfg_recv = cfg_recv.resubscribe();
+    let mut semaphore_cfg_recv = cfg_recv.resubscribe();
+
+    let cluster_task = cluster::run_node(transport, &mut cluster_cfg_recv, cluster_client_sender);
+    let raft_task = raft::run_raft(transport, &mut raft_cfg_recv, raft_client_sender);
+    let semaphore_task =
+        semaphore::run_semaphore(transport, &mut semaphore_cfg_recv, semaphore_client_sender);
 
     let _config = tokio::spawn(async move {
         let (cluster_client, raft_client, semaphore_client) =

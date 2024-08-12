@@ -1,6 +1,6 @@
 use crate::{
     cluster::{ClusterClient, ClusterConfig},
-    raft_leader::{RaftClient, RaftConfig},
+    raft::{RaftClient, RaftConfig},
     semaphore::{SemaphoreClient, SemaphoreConfig},
 };
 

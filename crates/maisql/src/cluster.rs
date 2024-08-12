@@ -270,6 +270,12 @@ pub enum ClusterClientRequest {
     ListRaftNodes {
         respond: oneshot::Sender<Vec<NodeId>>,
     },
+    ListObserverNodes {
+        respond: oneshot::Sender<Vec<NodeId>>,
+    },
+    ListAllNodes {
+        respond: oneshot::Sender<Vec<NodeId>>,
+    },
 }
 
 async fn handle_client_request(
@@ -296,6 +302,31 @@ async fn handle_client_request(
             respond.send(nodes);
             Ok(())
         }
+        ClusterClientRequest::ListObserverNodes { respond } => {
+            let mut nodes: Vec<NodeId> = state
+                .nodes
+                .iter()
+                .filter_map(|(k, v)| match v.raft_voter {
+                    true => None,
+                    false => Some(k.to_owned()),
+                })
+                .collect();
+
+            if !state.local_node.state.raft_voter {
+                nodes.push(state.local_node.id.to_owned());
+            }
+
+            respond.send(nodes);
+            Ok(())
+        }
+        ClusterClientRequest::ListAllNodes { respond } => {
+            let mut nodes: Vec<NodeId> = state.nodes.keys().cloned().collect();
+            nodes.push(state.local_node.id.to_owned());
+
+            respond.send(nodes);
+
+            Ok(())
+        }
     }
 }
 
@@ -312,6 +343,24 @@ impl ClusterClient {
     pub async fn list_raft_nodes(&self) -> anyhow::Result<Vec<NodeId>> {
         let (tx, rx) = oneshot::channel();
         let req = ClusterClientRequest::ListRaftNodes { respond: tx };
+
+        let _ = self.sender.send(req).await?;
+        let response = rx.await?;
+
+        return Ok(response);
+    }
+    pub async fn list_observer_nodes(&self) -> anyhow::Result<Vec<NodeId>> {
+        let (tx, rx) = oneshot::channel();
+        let req = ClusterClientRequest::ListObserverNodes { respond: tx };
+
+        let _ = self.sender.send(req).await?;
+        let response = rx.await?;
+
+        return Ok(response);
+    }
+    pub async fn list_all_nodes(&self) -> anyhow::Result<Vec<NodeId>> {
+        let (tx, rx) = oneshot::channel();
+        let req = ClusterClientRequest::ListAllNodes { respond: tx };
 
         let _ = self.sender.send(req).await?;
         let response = rx.await?;
