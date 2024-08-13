@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 mod cluster;
 mod config;
+mod locks;
 pub mod manager;
 mod raft;
 mod semaphore;
