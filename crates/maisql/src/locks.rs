@@ -1,10 +1,12 @@
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     mem,
     time::{Duration, SystemTime},
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{self, Digest, Sha256};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::{
@@ -20,13 +22,15 @@ pub struct LocksConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotDigest {
     snapshot_id: u128,
+    snapshot_checksum: [u8; 32],
     entry_id: u128,
+    entry_checksum: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SnapshotDelta {
     FullSnapshot(Snapshot),
-    Entries(Entry),
+    Entries(NextEntry),
     EmptyDelta,
 }
 
@@ -86,11 +90,16 @@ impl Snapshot {
             Some(entry) => entry.commit_to(committed),
         }
     }
-    pub fn entries_from(&self, entry_id: u128) -> Option<Entry> {
+    pub fn entries_from(&self, entry_id: u128) -> Option<NextEntry> {
         self.entries
             .as_ref()
             .map(|entry| entry.entries_from(entry_id))
             .flatten()
+    }
+    pub fn entries_to(&self, entry_id: u128) -> Option<NextEntry> {
+        self.entries
+            .as_ref()
+            .map(|entry| entry.entries_to(entry_id))
     }
     pub fn compact(&self) -> Self {
         let mut locks = self.locks.clone();
@@ -110,24 +119,56 @@ impl Snapshot {
             },
         }
     }
+    pub fn generate_snapshot_checksum(&self) -> [u8; 32] {
+        let mut locks_vec: Vec<_> = self
+            .locks
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        locks_vec.sort_by(|(k1, _), (k2, _)| -> Ordering { k1.cmp(&k2) });
+
+        let serialized = rmp_serde::to_vec(&locks_vec).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(serialized);
+
+        hasher.finalize().into()
+    }
+    pub fn generate_entries_checksum(&self, until: Option<u128>) -> [u8; 32] {
+        let entries = match until {
+            None => self.entries.clone(),
+            Some(until) => self.entries_to(until),
+        };
+
+        let serialized = rmp_serde::to_vec(&entries).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(serialized);
+
+        hasher.finalize().into()
+    }
     pub fn generate_digest(&self) -> SnapshotDigest {
         let last = self.last_id();
         SnapshotDigest {
             snapshot_id: self.id,
+            snapshot_checksum: self.generate_snapshot_checksum(),
             entry_id: last,
+            entry_checksum: self.generate_entries_checksum(None),
         }
     }
     pub fn generate_delta(&self, digest: SnapshotDigest) -> SnapshotDelta {
-        if self.id > digest.snapshot_id {
+        if digest.snapshot_id < self.id {
             SnapshotDelta::FullSnapshot(self.clone())
+        } else if digest.snapshot_id == self.id
+            && digest.snapshot_checksum != self.generate_snapshot_checksum()
+        {
+            SnapshotDelta::FullSnapshot(self.clone())
+        } else if digest.entry_checksum != self.generate_entries_checksum(Some(digest.entry_id)) {
+            SnapshotDelta::FullSnapshot(self.clone())
+        } else if digest.entry_id < self.last_id() {
+            self.entries_from(digest.entry_id + 1)
+                .map(SnapshotDelta::Entries)
+                .unwrap_or(SnapshotDelta::EmptyDelta)
         } else {
-            match self.last_id() > digest.entry_id {
-                true => match self.entries_from(digest.entry_id + 1) {
-                    Some(entry) => SnapshotDelta::Entries(entry),
-                    None => SnapshotDelta::EmptyDelta,
-                },
-                false => SnapshotDelta::EmptyDelta,
-            }
+            SnapshotDelta::EmptyDelta
         }
     }
     pub fn apply_delta(&mut self, delta: SnapshotDelta) {
@@ -135,8 +176,16 @@ impl Snapshot {
             SnapshotDelta::FullSnapshot(snap) => {
                 *self = snap;
             }
-            SnapshotDelta::Entries()
+            SnapshotDelta::Entries(entries) => {
+                self.push_entries(entries);
+            }
+            SnapshotDelta::EmptyDelta => {}
         }
+    }
+    pub fn push_entries(&mut self, entries: NextEntry) {
+        self.entries
+            .as_mut()
+            .map(|entry| entry.push_entries(entries));
     }
 }
 
@@ -223,16 +272,27 @@ impl Entry {
             }
         }
     }
-    pub fn entries_from(&self, entry_id: u128) -> Option<Entry> {
-        if entry_id < self.id {
-            None
+    pub fn entries_from(&self, entry_id: u128) -> Option<NextEntry> {}
+    pub fn entries_to(&self, entry_id: u128) -> Entry {
+        if entry_id > self.id {
+            Entry {
+                id: u128::max_value(),
+                value: EntryType::NoOp,
+                next: None,
+            }
         } else if entry_id == self.id {
-            Some(self.clone())
+            Entry {
+                id: self.id,
+                value: self.value.to_owned(),
+                next: None,
+            }
         } else {
-            self.next
-                .as_ref()
-                .map(|next_entry| next_entry.entries_from(entry_id))
-                .flatten()
+            let next_entry = self.next.as_ref().map(|next| next.entries_to(entry_id));
+            Entry {
+                id: self.id,
+                value: self.value.to_owned(),
+                next: next_entry,
+            }
         }
     }
     pub fn compact(&self, prev_locks: &mut HashMap<String, Lock>) -> Snapshot {
@@ -252,6 +312,13 @@ impl Entry {
             },
         }
     }
+    pub fn push_entries(&mut self, start: NextEntry) {
+        if self.id + 1 == start.inner().id {
+            self.next = Some(start);
+        } else {
+            self.next.as_mut().map(|next| next.push_entries(start));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +328,16 @@ enum NextEntry {
 }
 
 impl NextEntry {
+    pub fn inner(&self) -> &Entry {
+        match &self {
+            Self::Committed(entry) | Self::Proposed(entry) => entry,
+        }
+    }
+    pub fn inner_mut(&mut self) -> &mut Entry {
+        match self {
+            Self::Committed(entry) | Self::Proposed(entry) => entry,
+        }
+    }
     pub fn is_committed(&self) -> bool {
         match self {
             Self::Committed(..) => true,
@@ -298,14 +375,10 @@ impl NextEntry {
         }
     }
     pub fn last_id(&self) -> u128 {
-        match self {
-            Self::Committed(entry) | Self::Proposed(entry) => entry.last_id(),
-        }
+        self.inner().last_id()
     }
     pub fn push(&mut self, value: EntryType) {
-        match self {
-            Self::Committed(entry) | Self::Proposed(entry) => entry.push(value),
-        }
+        self.inner_mut().push(value);
     }
     pub fn committed_state(&self, prev: &mut HashMap<String, Lock>) {
         match self {
@@ -336,15 +409,20 @@ impl NextEntry {
             }
         }
     }
-    pub fn entries_from(&self, entry_id: u128) -> Option<Entry> {
+    pub fn entries_from(&self, entry_id: u128) -> Option<NextEntry> {}
+    pub fn entries_to(&self, entry_id: u128) -> NextEntry {
         match self {
-            Self::Committed(entry) | Self::Proposed(entry) => entry.entries_from(entry_id),
+            Self::Proposed(entry) => Self::Proposed(entry.entries_to(entry_id)),
+            Self::Committed(entry) => Self::Committed(entry.entries_to(entry_id)),
         }
     }
     pub fn compact(&self, prev_locks: &mut HashMap<String, Lock>) -> Snapshot {
         match self {
             Self::Committed(entry) | Self::Proposed(entry) => entry.compact(prev_locks),
         }
+    }
+    pub fn push_entries(&mut self, start: Self) {
+        self.inner_mut().push_entries(start);
     }
 }
 
