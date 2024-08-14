@@ -7,24 +7,50 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{self, Digest, Sha256};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::{
+    sync::{broadcast, mpsc, oneshot},
+    time::{self, Instant},
+};
 
 use crate::{
     config::Config,
-    transport::{NodeId, Transport},
+    transport::{NodeId, Transport, TransportData},
 };
 
 #[derive(Debug, Clone)]
 pub struct LocksConfig {
     lock_default_timeout: Duration,
+    lock_service_heartbeat: Duration,
+    /// The percentage of *raft* nodes which must have replicated an entry before it can be committed.
+    /// min: 0.5, max: 1.0
+    entry_commit_minimum_replication_ratio: f64,
+    /// The interval between which to compact logs.
+    compaction_interval: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct State {
+    follower_digests: HashMap<NodeId, SnapshotDigest>,
+    current_snapshot: Snapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotDigest {
-    snapshot_id: u128,
+    pub snapshot_id: u128,
     snapshot_checksum: [u8; 32],
     entry_id: u128,
     entry_checksum: [u8; 32],
+}
+
+impl SnapshotDigest {
+    pub fn replicated(&self, leader: &Snapshot) -> u128 {
+        let leader_checksum = leader.generate_entries_checksum(Some(self.entry_id));
+        if leader_checksum != self.entry_checksum {
+            return 0;
+        } else {
+            return self.entry_id;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,7 +220,9 @@ impl Snapshot {
             .map(|entry| entry.push_entries(entries));
     }
     pub fn remove_entries(&mut self, from: u128) {
-        self.entries.as_mut().map(|entries| entries.remove_entries(from));
+        self.entries
+            .as_mut()
+            .map(|entries| entries.remove_entries(from));
     }
 }
 
@@ -282,7 +310,10 @@ impl Entry {
         }
     }
     pub fn entries_from(&self, entry_id: u128) -> Option<NextEntry> {
-        self.next.as_ref().map(|next_entry| next_entry.entries_from(entry_id)).flatten()
+        self.next
+            .as_ref()
+            .map(|next_entry| next_entry.entries_from(entry_id))
+            .flatten()
     }
     pub fn entries_to(&self, entry_id: u128) -> Entry {
         if entry_id > self.id {
@@ -330,11 +361,11 @@ impl Entry {
             self.next.as_mut().map(|next| next.push_entries(start));
         }
     }
-pub  fn remove_entries(&mut self, from: u128) {
-    if self.id == from - 1 {
-        self.next = None
+    pub fn remove_entries(&mut self, from: u128) {
+        if self.id == from - 1 {
+            self.next = None
+        }
     }
-}
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,7 +466,7 @@ impl NextEntry {
     pub fn entries_to(&self, entry_id: u128) -> NextEntry {
         match self {
             Self::Committed(entry) => Self::Committed(Box::new(entry.entries_to(entry_id))),
-            Self::Proposed(entry) => Self::Proposed(Box::new(entry.entries_to(entry_id)))
+            Self::Proposed(entry) => Self::Proposed(Box::new(entry.entries_to(entry_id))),
         }
     }
     pub fn compact(&self, prev_locks: &mut HashMap<String, Lock>) -> Snapshot {
@@ -485,11 +516,279 @@ pub async fn run_locks(
     config: &mut broadcast::Receiver<Config>,
     client_sender: oneshot::Sender<LocksClient>,
 ) -> anyhow::Result<()> {
-    todo!()
+    let (client, mut client_rx) = LocksClient::new();
+    client_sender.send(client);
+
+    let config = config.recv().await.unwrap();
+
+    let mut state = State {
+        current_snapshot: Snapshot {
+            id: 0,
+            locks: HashMap::new(),
+            entries: None,
+        },
+        follower_digests: HashMap::new(),
+    };
+    let mut heartbeat = time::interval(config.locks_config.lock_service_heartbeat);
+    let mut compaction = time::interval(config.locks_config.compaction_interval);
+
+    loop {
+        let _ = tokio::select! {
+            Some((bytes, from)) = transport.recv() => handle_transport_data(bytes, from, transport, config.to_owned(), &mut state).await,
+            Some(req) = client_rx.recv() => handle_client_request(req, transport, config.to_owned(), &mut state).await,
+            instant = heartbeat.tick() => handle_heartbeat(instant, transport, config.to_owned(), &mut state).await,
+            _ = compaction.tick() => handle_compaction(transport, config.to_owned(), &mut state).await,
+        };
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "lock_msg_type")]
+enum LocksMessage {
+    AquireLock { resource: String, data: String },
+    RenewLock { resource: String },
+    EditLock { resource: String, new_data: String },
+    ReleaseLock { resource: String },
+    Digest(SnapshotDigest),
+    Delta(SnapshotDelta),
+}
+
+impl TransportData for LocksMessage {}
+
+async fn handle_transport_data(
+    bytes: &[u8],
+    from: NodeId,
+    transport: &impl Transport,
+    config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    let message = LocksMessage::parse(bytes, "locks_message")?;
+    let is_leader = config
+        .raft_client
+        .self_is_leader(config.to_owned())
+        .await
+        .unwrap_or(false);
+
+    match is_leader {
+        true => handle_message_as_leader(message, from, transport, config, state).await,
+        false => handle_message_as_replica(message, from, transport, config, state).await,
+    }
+}
+
+async fn handle_message_as_leader(
+    message: LocksMessage,
+    from: NodeId,
+    transport: &impl Transport,
+    config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    let current_state = state.current_snapshot.proposed_state();
+
+    let new_entry: Option<EntryType> = match message {
+        LocksMessage::AquireLock { resource, data } => {
+            if let None = current_state.get(&resource) {
+                let expires = SystemTime::now() + config.locks_config.lock_default_timeout;
+                Some(EntryType::AquireLock {
+                    resource,
+                    holder: from,
+                    expires,
+                    data,
+                })
+            } else {
+                None
+            }
+        }
+        LocksMessage::RenewLock { resource } => {
+            if let Some(lock) = current_state.get(&resource) {
+                if lock.holder == from {
+                    let new_expiration =
+                        SystemTime::now() + config.locks_config.lock_default_timeout;
+                    Some(EntryType::RenewLock {
+                        resource,
+                        new_expiration,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        LocksMessage::EditLock { resource, new_data } => {
+            if let Some(lock) = current_state.get(&resource) {
+                if lock.data != new_data && lock.holder == from {
+                    Some(EntryType::ModifyLockData { resource, new_data })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        LocksMessage::ReleaseLock { resource } => {
+            if let Some(lock) = current_state.get(&resource) {
+                if lock.holder == from {
+                    Some(EntryType::ReleaseLock { resource })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        LocksMessage::Digest(digest) => {
+            state.follower_digests.insert(from.clone(), digest.clone());
+            let delta = state.current_snapshot.generate_delta(digest);
+            let message = LocksMessage::Delta(delta);
+            transport
+                .send_unreliable(from, &message.serialize_for_send())
+                .await;
+
+            handle_commit_calculations(transport, config, state).await;
+
+            None
+        }
+        LocksMessage::Delta(..) => None,
+    };
+
+    if let Some(new_entry) = new_entry {
+        state.current_snapshot.push(new_entry);
+    }
+
+    Ok(())
+}
+
+async fn handle_message_as_replica(
+    message: LocksMessage,
+    from: NodeId,
+    _transport: &impl Transport,
+    config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    let leader = config.raft_client.leader().await?;
+
+    match message {
+        LocksMessage::Delta(delta) => {
+            if Some(from) == leader {
+                state.current_snapshot.apply_delta(delta);
+            }
+        }
+        _ => {}
+    };
+
+    Ok(())
+}
+
+async fn handle_heartbeat(
+    _instant: Instant,
+    transport: &impl Transport,
+    config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    let leader = config.raft_client.leader().await?;
+
+    if leader == Some(config.cluster_config.own_node_id) {
+        let current_state = state.current_snapshot.proposed_state();
+        let expired_locks = current_state
+            .iter()
+            .filter_map(|(resource, lock)| {
+                let is_expired = lock.expires.gt(&SystemTime::now());
+
+                match is_expired {
+                    false => None,
+                    true => Some(resource),
+                }
+            })
+            .collect::<Vec<&String>>();
+
+        for resource in expired_locks {
+            state.current_snapshot.push(EntryType::ReleaseLock {
+                resource: resource.to_owned(),
+            });
+        }
+    } else {
+        if let Some(leader) = leader {
+            let digest = state.current_snapshot.generate_digest();
+            let message = LocksMessage::Digest(digest);
+            transport
+                .send_unreliable(leader, &message.serialize_for_send())
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_commit_calculations(
+    transport: &impl Transport,
+    config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    let raft_nodes = config.cluster_client.list_raft_nodes().await?;
+
+    let checkpoints = state
+        .follower_digests
+        .iter()
+        .filter(|(node, _digest)| raft_nodes.contains(node))
+        .map(|(node, digest)| (digest.replicated(&state.current_snapshot), node))
+        .collect::<Vec<_>>();
+
+    let mut checkpoint_counts: HashMap<u128, u32> = HashMap::new();
+
+    for (replicated, _node) in checkpoints {
+        checkpoint_counts
+            .entry(replicated)
+            .and_modify(|count| {
+                *count += 1;
+            })
+            .or_insert(1);
+    }
+
+    let min_replications_to_commit = (raft_nodes.len() as f64
+        * config.locks_config.entry_commit_minimum_replication_ratio)
+        .ceil() as u32;
+    let mut committable_entries: Vec<_> = checkpoint_counts
+        .iter()
+        .filter_map(
+            |(entry_id, replications)| match *replications >= min_replications_to_commit {
+                true => Some(entry_id),
+                false => None,
+            },
+        )
+        .collect();
+
+    committable_entries.sort();
+
+    let last_committable = committable_entries.last().to_owned();
+
+    last_committable.map(|index| {
+        state.current_snapshot.commit_to(**index);
+    });
+
+    Ok(())
+}
+
+async fn handle_compaction(
+    _transport: &impl Transport,
+    _config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    state.current_snapshot.compact();
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
 pub enum LocksClientRequest {}
+
+async fn handle_client_request(
+    req: LocksClientRequest,
+    transport: &impl Transport,
+    config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    todo!()
+}
 
 pub struct LocksClient {
     sender: mpsc::Sender<LocksClientRequest>,
