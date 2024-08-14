@@ -30,7 +30,8 @@ pub struct SnapshotDigest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SnapshotDelta {
     FullSnapshot(Snapshot),
-    Entries(NextEntry),
+    AppendEntries(NextEntry),
+    DeleteEntries(u128),
     EmptyDelta,
 }
 
@@ -165,8 +166,10 @@ impl Snapshot {
             SnapshotDelta::FullSnapshot(self.clone())
         } else if digest.entry_id < self.last_id() {
             self.entries_from(digest.entry_id + 1)
-                .map(SnapshotDelta::Entries)
+                .map(SnapshotDelta::AppendEntries)
                 .unwrap_or(SnapshotDelta::EmptyDelta)
+        } else if digest.entry_id > self.last_id() {
+            SnapshotDelta::DeleteEntries(self.last_id() + 1)
         } else {
             SnapshotDelta::EmptyDelta
         }
@@ -176,8 +179,11 @@ impl Snapshot {
             SnapshotDelta::FullSnapshot(snap) => {
                 *self = snap;
             }
-            SnapshotDelta::Entries(entries) => {
+            SnapshotDelta::AppendEntries(entries) => {
                 self.push_entries(entries);
+            }
+            SnapshotDelta::DeleteEntries(from) => {
+                self.remove_entries(from);
             }
             SnapshotDelta::EmptyDelta => {}
         }
@@ -186,6 +192,9 @@ impl Snapshot {
         self.entries
             .as_mut()
             .map(|entry| entry.push_entries(entries));
+    }
+    pub fn remove_entries(&mut self, from: u128) {
+        self.entries.as_mut().map(|entries| entries.remove_entries(from));
     }
 }
 
@@ -272,7 +281,9 @@ impl Entry {
             }
         }
     }
-    pub fn entries_from(&self, entry_id: u128) -> Option<NextEntry> {}
+    pub fn entries_from(&self, entry_id: u128) -> Option<NextEntry> {
+        self.next.as_ref().map(|next_entry| next_entry.entries_from(entry_id)).flatten()
+    }
     pub fn entries_to(&self, entry_id: u128) -> Entry {
         if entry_id > self.id {
             Entry {
@@ -319,6 +330,11 @@ impl Entry {
             self.next.as_mut().map(|next| next.push_entries(start));
         }
     }
+pub  fn remove_entries(&mut self, from: u128) {
+    if self.id == from - 1 {
+        self.next = None
+    }
+}
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,11 +425,17 @@ impl NextEntry {
             }
         }
     }
-    pub fn entries_from(&self, entry_id: u128) -> Option<NextEntry> {}
+    pub fn entries_from(&self, entry_id: u128) -> Option<NextEntry> {
+        if self.inner().id == entry_id {
+            return Some(self.clone());
+        } else {
+            return self.inner().entries_from(entry_id);
+        }
+    }
     pub fn entries_to(&self, entry_id: u128) -> NextEntry {
         match self {
-            Self::Proposed(entry) => Self::Proposed(entry.entries_to(entry_id)),
-            Self::Committed(entry) => Self::Committed(entry.entries_to(entry_id)),
+            Self::Committed(entry) => Self::Committed(Box::new(entry.entries_to(entry_id))),
+            Self::Proposed(entry) => Self::Proposed(Box::new(entry.entries_to(entry_id)))
         }
     }
     pub fn compact(&self, prev_locks: &mut HashMap<String, Lock>) -> Snapshot {
@@ -423,6 +445,9 @@ impl NextEntry {
     }
     pub fn push_entries(&mut self, start: Self) {
         self.inner_mut().push_entries(start);
+    }
+    pub fn remove_entries(&mut self, from: u128) {
+        self.inner_mut().remove_entries(from);
     }
 }
 
@@ -460,6 +485,7 @@ pub async fn run_locks(
     config: &mut broadcast::Receiver<Config>,
     client_sender: oneshot::Sender<LocksClient>,
 ) -> anyhow::Result<()> {
+    todo!()
 }
 
 #[derive(Debug, Clone)]
