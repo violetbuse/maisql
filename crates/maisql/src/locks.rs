@@ -20,6 +20,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct LocksConfig {
     lock_default_timeout: Duration,
+    /// This mainly controls how often replicas try to sync with the leader.
     lock_service_heartbeat: Duration,
     /// The percentage of *raft* nodes which must have replicated an entry before it can be committed.
     /// min: 0.5, max: 1.0
@@ -506,9 +507,9 @@ enum EntryType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Lock {
-    holder: NodeId,
-    expires: SystemTime,
-    data: String,
+    pub holder: NodeId,
+    pub expires: SystemTime,
+    pub data: String,
 }
 
 pub async fn run_locks(
@@ -720,7 +721,7 @@ async fn handle_heartbeat(
 }
 
 async fn handle_commit_calculations(
-    transport: &impl Transport,
+    _transport: &impl Transport,
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
@@ -778,8 +779,27 @@ async fn handle_compaction(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-pub enum LocksClientRequest {}
+#[derive(Debug)]
+pub enum LocksClientRequest {
+    GetLock {
+        resource: String,
+        response: oneshot::Sender<Option<Lock>>,
+    },
+    AquireLock {
+        resource: String,
+        data: String,
+    },
+    RenewLock {
+        resource: String,
+    },
+    UpdateLockData {
+        resource: String,
+        data: String,
+    },
+    ReleaseLock {
+        resource: String,
+    },
+}
 
 async fn handle_client_request(
     req: LocksClientRequest,
@@ -787,9 +807,59 @@ async fn handle_client_request(
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
-    todo!()
+    let leader = config.raft_client.leader().await.ok().flatten();
+
+    match req {
+        LocksClientRequest::GetLock { resource, response } => {
+            let locks = state.current_snapshot.committed_state();
+            let lock = locks.get(&resource).map(|lock| lock.to_owned());
+
+            response.send(lock);
+            Ok(())
+        }
+        LocksClientRequest::AquireLock { resource, data } => {
+            if let Some(leader_id) = leader {
+                let msg = LocksMessage::AquireLock { resource, data };
+                let data = msg.serialize_for_send();
+                transport.send_reliable(leader_id, &data).await?;
+            }
+
+            Ok(())
+        }
+        LocksClientRequest::RenewLock { resource } => {
+            if let Some(leader_id) = leader {
+                let msg = LocksMessage::RenewLock { resource };
+                let data = msg.serialize_for_send();
+                transport.send_reliable(leader_id, &data).await?;
+            }
+
+            Ok(())
+        }
+        LocksClientRequest::UpdateLockData { resource, data } => {
+            if let Some(leader_id) = leader {
+                let msg = LocksMessage::EditLock {
+                    resource,
+                    new_data: data,
+                };
+                let data = msg.serialize_for_send();
+                transport.send_reliable(leader_id, &data).await?;
+            }
+
+            Ok(())
+        }
+        LocksClientRequest::ReleaseLock { resource } => {
+            if let Some(leader_id) = leader {
+                let msg = LocksMessage::ReleaseLock { resource };
+                let data = msg.serialize_for_send();
+                transport.send_reliable(leader_id, &data).await?;
+            }
+
+            Ok(())
+        }
+    }
 }
 
+#[derive(Debug, Clone)]
 pub struct LocksClient {
     sender: mpsc::Sender<LocksClientRequest>,
 }
@@ -798,5 +868,33 @@ impl LocksClient {
     pub fn new() -> (Self, mpsc::Receiver<LocksClientRequest>) {
         let (tx, rx) = mpsc::channel(128);
         return (Self { sender: tx }, rx);
+    }
+    pub async fn lock_info(&self, resource: String) -> anyhow::Result<Option<Lock>> {
+        let (tx, rx) = oneshot::channel();
+        let req = LocksClientRequest::GetLock {
+            resource,
+            response: tx,
+        };
+
+        self.sender.send(req).await?;
+        let result = rx.await?;
+
+        Ok(result)
+    }
+    pub async fn aquire_lock(&self, resource: String, data: String) {
+        let req = LocksClientRequest::AquireLock { resource, data };
+        self.sender.send(req).await;
+    }
+    pub async fn renew_lock(&self, resource: String) {
+        let req = LocksClientRequest::RenewLock { resource };
+        self.sender.send(req).await;
+    }
+    pub async fn modify_lock(&self, resource: String, data: String) {
+        let req = LocksClientRequest::UpdateLockData { resource, data };
+        self.sender.send(req).await;
+    }
+    pub async fn release_lock(&self, resource: String) {
+        let req = LocksClientRequest::ReleaseLock { resource };
+        self.sender.send(req).await;
     }
 }
