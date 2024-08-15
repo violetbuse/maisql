@@ -1,5 +1,6 @@
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, mem, time::Duration};
 
+use anyhow::anyhow;
 use futures::future::join_all;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -24,26 +25,45 @@ pub struct RaftConfig {
     pub max_election_timeout: Duration,
 }
 
-// struct State {
-//     term: Term,
-// }
-
 enum State {
-    Voter {
-        term: Term,
-    },
-    Observer {
-        leader: Option<NodeId>,
-        current_term: u64,
-    },
+    Voter { term: Term },
+    Observer { leader: Option<NodeId>, term: u64 },
 }
 
+#[derive(Debug, Clone, Default)]
 struct Term {
     id: u64,
-    leader: Option<NodeId>,
     voted: bool,
     votes_received: HashSet<NodeId>,
+    leader: Option<NodeId>,
     last_leader_heartbeat: Option<Instant>,
+    previous_term: Option<Box<Term>>,
+}
+
+impl Term {
+    pub fn new_term(&mut self) {
+        let mut next_term = Term::default();
+        next_term.id = self.id + 1;
+
+        let old_term = mem::replace(self, next_term);
+        self.previous_term = Some(Box::new(old_term));
+    }
+    pub fn push_term(&mut self, new_term_id: u64) {
+        let mut new_term = Term::default();
+        new_term.id = new_term_id;
+
+        let old_term = mem::replace(self, new_term);
+        self.previous_term = Some(Box::new(old_term));
+    }
+    pub fn add_vote(&mut self, voted: NodeId) {
+        self.votes_received.insert(voted);
+    }
+    pub fn majority(&self, node_count: usize) -> bool {
+        (self.votes_received.len() as f64 / node_count as f64) > 0.5
+    }
+    pub fn register_leader_heartbeat(&mut self) {
+        self.last_leader_heartbeat = Some(Instant::now());
+    }
 }
 
 pub async fn run_raft(
@@ -60,17 +80,11 @@ pub async fn run_raft(
 
     let mut state = match config.raft.raft_voter {
         true => State::Voter {
-            term: Term {
-                id: 0,
-                leader: None,
-                voted: false,
-                votes_received: HashSet::new(),
-                last_leader_heartbeat: None,
-            },
+            term: Term::default(),
         },
         false => State::Observer {
             leader: None,
-            current_term: 0,
+            term: 0,
         },
     };
 
@@ -130,32 +144,24 @@ async fn handle_transport_message(
 }
 
 async fn handle_leader_heartbeat(
-    term: u64,
+    req_term: u64,
     from: NodeId,
     _transport: &impl Transport,
     _config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
     match state {
-        State::Voter { term: state_term } => {
-            if term == state_term.id {
-                state_term.last_leader_heartbeat = Some(Instant::now());
-            } else if term > state_term.id {
-                *state_term = Term {
-                    id: term,
-                    leader: Some(from),
-                    voted: false,
-                    votes_received: HashSet::new(),
-                    last_leader_heartbeat: Some(Instant::now()),
-                };
+        State::Voter { term } => {
+            if req_term == term.id {
+                term.register_leader_heartbeat();
+            } else if req_term > term.id {
+                term.push_term(req_term);
+                term.register_leader_heartbeat();
             }
         }
-        State::Observer {
-            leader,
-            current_term,
-        } => {
-            if term >= *current_term {
-                *current_term = term;
+        State::Observer { leader, term } => {
+            if req_term >= *term {
+                *term = req_term;
                 *leader = Some(from);
             }
         }
@@ -165,26 +171,27 @@ async fn handle_leader_heartbeat(
 }
 
 async fn handle_announce_leadership(
-    term: u64,
+    req_term: u64,
     from: NodeId,
     _transport: &impl Transport,
     _config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
     match state {
-        State::Voter { term: state_term } => {
-            if term >= state_term.id {
-                state_term.last_leader_heartbeat = Some(Instant::now());
-                state_term.leader = Some(from);
+        State::Voter { term } => {
+            if req_term > term.id {
+                term.push_term(req_term);
+                term.leader = Some(from);
+                term.register_leader_heartbeat();
+            } else if req_term == term.id {
+                term.leader = Some(from);
+                term.register_leader_heartbeat();
             }
         }
-        State::Observer {
-            leader,
-            current_term,
-        } => {
-            if term >= *current_term {
-                *current_term = term;
-                *leader = Some(from)
+        State::Observer { leader, term } => {
+            if req_term >= *term {
+                *term = req_term;
+                *leader = Some(from);
             }
         }
     }
@@ -193,40 +200,31 @@ async fn handle_announce_leadership(
 }
 
 async fn handle_announce_candidate(
-    term: u64,
+    req_term: u64,
     from: NodeId,
     transport: &impl Transport,
     _config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
     match state {
-        State::Voter { term: state_term } => {
-            if term > state_term.id {
-                *state_term = Term {
-                    id: term,
-                    leader: None,
-                    voted: false,
-                    votes_received: HashSet::new(),
-                    last_leader_heartbeat: None,
-                };
+        State::Voter { term } => {
+            if req_term > term.id {
+                term.push_term(req_term);
             }
 
-            if !state_term.voted {
-                state_term.voted = true;
-                let commit_msg = RaftMessage::CommitVote { term };
+            if !term.voted {
+                term.voted = true;
+                let commit_msg = RaftMessage::CommitVote { term: req_term };
 
                 let _ = transport
                     .send_reliable(from, &commit_msg.serialize_for_send())
                     .await;
             }
         }
-        State::Observer {
-            leader,
-            current_term,
-        } => {
-            if term > *current_term {
+        State::Observer { leader, term } => {
+            if req_term > *term {
                 *leader = None;
-                *current_term = term;
+                *term = req_term;
             }
         }
     }
@@ -235,29 +233,30 @@ async fn handle_announce_candidate(
 }
 
 async fn handle_commit_vote(
-    term: u64,
+    req_term: u64,
     from: NodeId,
     transport: &impl Transport,
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
     match state {
-        State::Voter { term: state_term } => {
-            if term == state_term.id {
-                state_term.votes_received.insert(from);
-                let total_votes_received = state_term.votes_received.len();
+        State::Voter { term } => {
+            if req_term == term.id {
+                term.add_vote(from);
+
                 let raft_nodes = config.cluster_client().list_raft_nodes().await?;
-                let raft_node_count = raft_nodes.len();
+                let promote = term.majority(raft_nodes.len());
 
-                let vote_percentage = total_votes_received as f64 / raft_node_count as f64;
+                if promote {
+                    term.leader = Some(config.cluster.own_node_id);
+                    let msg = RaftMessage::AnnounceLeadership { term: req_term };
+                    let data = msg.serialize_for_send();
 
-                if vote_percentage > 0.5 {
-                    state_term.leader = Some(config.cluster.own_node_id);
-                    let message = RaftMessage::AnnounceLeadership { term };
-                    let serialized = message.serialize_for_send();
-                    join_all(raft_nodes.iter().map(|node| {
-                        transport.send_reliable(node.to_owned(), &serialized.as_slice())
-                    }))
+                    join_all(
+                        raft_nodes
+                            .iter()
+                            .map(|node| transport.send_reliable(node.to_owned(), &data)),
+                    )
                     .await;
                 }
             }
@@ -301,8 +300,8 @@ async fn handle_election_timeout(
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
-    if let State::Voter { term: state_term } = state {
-        let elapsed_since_hb = state_term
+    if let State::Voter { term } = state {
+        let elapsed_since_hb = term
             .last_leader_heartbeat
             .map(|hb| Instant::now().duration_since(hb))
             .unwrap_or(
@@ -312,33 +311,24 @@ async fn handle_election_timeout(
             );
 
         let leader_exists_but_died =
-            state_term.leader.is_some() && elapsed_since_hb.gt(&election_timeout);
+            term.leader.is_some() && elapsed_since_hb.gt(&election_timeout);
 
-        let should_become_candidate = leader_exists_but_died && state_term.voted == false;
+        let should_become_candidate = leader_exists_but_died && term.voted == false;
 
         if should_become_candidate {
-            *state_term = Term {
-                id: state_term.id + 1,
-                leader: None,
-                voted: false,
-                votes_received: HashSet::new(),
-                last_leader_heartbeat: None,
-            };
+            term.new_term();
 
-            state_term.voted = true;
-            state_term
-                .votes_received
+            term.voted = true;
+            term.votes_received
                 .insert(config.cluster.own_node_id.clone());
 
             let raft_nodes = config.cluster_client().list_raft_nodes().await?;
             let raft_node_count = raft_nodes.len();
 
             if raft_node_count == 1 {
-                state_term.leader = Some(config.cluster.own_node_id.clone());
+                term.leader = Some(config.cluster.own_node_id.clone());
             } else {
-                let announcement = RaftMessage::AnnounceCandidate {
-                    term: state_term.id,
-                };
+                let announcement = RaftMessage::AnnounceCandidate { term: term.id };
                 let serialized = announcement.serialize_for_send();
 
                 let _ = join_all(
@@ -359,6 +349,26 @@ pub enum RaftClientRequest {
     QueryLeader {
         response: oneshot::Sender<Option<NodeId>>,
     },
+}
+
+async fn handle_raft_client_request(
+    req: RaftClientRequest,
+    _transport: &impl Transport,
+    _config: Config,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    match req {
+        RaftClientRequest::QueryLeader { response } => {
+            let leader = match state {
+                State::Voter { term } => term.leader.to_owned(),
+                State::Observer { leader, .. } => leader.to_owned(),
+            };
+
+            return response
+                .send(leader)
+                .map_err(|_| anyhow!("could not send raft leader response."));
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -393,26 +403,6 @@ impl From<Config> for RaftClient {
             sender: value.clone().raft.client,
             _cluster: value.clone().into(),
             _config: value.clone(),
-        }
-    }
-}
-
-async fn handle_raft_client_request(
-    req: RaftClientRequest,
-    _transport: &impl Transport,
-    _config: Config,
-    state: &mut State,
-) -> anyhow::Result<()> {
-    match req {
-        RaftClientRequest::QueryLeader { response } => {
-            let leader = match state {
-                State::Voter { term } => term.leader.to_owned(),
-                State::Observer { leader, .. } => leader.to_owned(),
-            };
-
-            let _ = response.send(leader);
-
-            Ok(())
         }
     }
 }
