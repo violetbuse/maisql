@@ -364,8 +364,8 @@ pub enum RaftClientRequest {
 #[derive(Debug, Clone)]
 pub struct RaftClient {
     sender: mpsc::Sender<RaftClientRequest>,
-    cluster: ClusterClient,
-    config: Config,
+    _cluster: ClusterClient,
+    _config: Config,
 }
 
 impl RaftClient {
@@ -391,8 +391,8 @@ impl From<Config> for RaftClient {
     fn from(value: Config) -> Self {
         Self {
             sender: value.clone().raft.client,
-            cluster: value.clone().into(),
-            config: value.clone(),
+            _cluster: value.clone().into(),
+            _config: value.clone(),
         }
     }
 }
