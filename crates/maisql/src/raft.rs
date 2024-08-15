@@ -4,17 +4,19 @@ use futures::future::join_all;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{broadcast, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     time::{self, Instant},
 };
 
 use crate::{
+    cluster::ClusterClient,
     config::Config,
     transport::{NodeId, Transport, TransportData},
 };
 
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
+    pub client: mpsc::Sender<RaftClientRequest>,
     /// Does this node participate in raft
     pub raft_voter: bool,
     pub heartbeat_interval: Duration,
@@ -46,22 +48,17 @@ struct Term {
 
 pub async fn run_raft(
     transport: &impl Transport,
-    config: &mut broadcast::Receiver<Config>,
-    client_sender: oneshot::Sender<RaftClient>,
+    config: Config,
+    client_rx: &mut mpsc::Receiver<RaftClientRequest>,
 ) -> anyhow::Result<()> {
-    let (client, mut client_rx) = RaftClient::new();
-    client_sender.send(client);
-
-    let config = config.recv().await.unwrap();
     let mut rng = rand::thread_rng();
-    let election_timeout = rng.gen_range(
-        config.raft_config.min_election_timeout..config.raft_config.max_election_timeout,
-    );
+    let election_timeout =
+        rng.gen_range(config.raft.min_election_timeout..config.raft.max_election_timeout);
 
     let mut election_timeout_interval = time::interval(election_timeout);
-    let mut heartbeat_interval = time::interval(config.raft_config.heartbeat_interval);
+    let mut heartbeat_interval = time::interval(config.raft.heartbeat_interval);
 
-    let mut state = match config.raft_config.raft_voter {
+    let mut state = match config.raft.raft_voter {
         true => State::Voter {
             term: Term {
                 id: 0,
@@ -77,7 +74,7 @@ pub async fn run_raft(
         },
     };
 
-    if config.raft_config.raft_voter {
+    if config.raft.raft_voter {
         loop {
             let _ = tokio::select! {
                 _ = election_timeout_interval.tick() => handle_election_timeout(election_timeout, transport, config.to_owned(), &mut state).await,
@@ -218,7 +215,7 @@ async fn handle_announce_candidate(
                 state_term.voted = true;
                 let commit_msg = RaftMessage::CommitVote { term };
 
-                transport
+                let _ = transport
                     .send_reliable(from, &commit_msg.serialize_for_send())
                     .await;
             }
@@ -249,18 +246,19 @@ async fn handle_commit_vote(
             if term == state_term.id {
                 state_term.votes_received.insert(from);
                 let total_votes_received = state_term.votes_received.len();
-                let raft_nodes = config.cluster_client.list_raft_nodes().await?;
+                let raft_nodes = config.cluster_client().list_raft_nodes().await?;
                 let raft_node_count = raft_nodes.len();
 
                 let vote_percentage = total_votes_received as f64 / raft_node_count as f64;
 
                 if vote_percentage > 0.5 {
-                    state_term.leader = Some(config.cluster_config.own_node_id);
+                    state_term.leader = Some(config.cluster.own_node_id);
                     let message = RaftMessage::AnnounceLeadership { term };
                     let serialized = message.serialize_for_send();
                     join_all(raft_nodes.iter().map(|node| {
                         transport.send_reliable(node.to_owned(), &serialized.as_slice())
-                    }));
+                    }))
+                    .await;
                 }
             }
         }
@@ -276,10 +274,10 @@ async fn handle_own_heartbeat(
     state: &mut State,
 ) -> anyhow::Result<()> {
     if let State::Voter { term: state_term } = state {
-        let local_is_leader = state_term.leader == Some(config.cluster_config.own_node_id);
+        let local_is_leader = state_term.leader == Some(config.clone().cluster.own_node_id);
 
         if local_is_leader {
-            let raft_nodes = config.cluster_client.list_raft_nodes().await?;
+            let raft_nodes = config.clone().cluster_client().list_raft_nodes().await?;
             let message = RaftMessage::LeaderHeartbeat {
                 term: state_term.id,
             };
@@ -289,7 +287,8 @@ async fn handle_own_heartbeat(
                 raft_nodes
                     .iter()
                     .map(|node| transport.send_reliable(node.to_owned(), &serialized)),
-            );
+            )
+            .await;
         }
     }
 
@@ -329,24 +328,25 @@ async fn handle_election_timeout(
             state_term.voted = true;
             state_term
                 .votes_received
-                .insert(config.cluster_config.own_node_id.clone());
+                .insert(config.cluster.own_node_id.clone());
 
-            let raft_nodes = config.cluster_client.list_raft_nodes().await?;
+            let raft_nodes = config.cluster_client().list_raft_nodes().await?;
             let raft_node_count = raft_nodes.len();
 
             if raft_node_count == 1 {
-                state_term.leader = Some(config.cluster_config.own_node_id.clone());
+                state_term.leader = Some(config.cluster.own_node_id.clone());
             } else {
                 let announcement = RaftMessage::AnnounceCandidate {
                     term: state_term.id,
                 };
                 let serialized = announcement.serialize_for_send();
 
-                join_all(
+                let _ = join_all(
                     raft_nodes
                         .iter()
                         .map(|node| transport.send_reliable(node.to_owned(), &serialized)),
-                );
+                )
+                .await;
             }
         }
     }
@@ -364,13 +364,11 @@ pub enum RaftClientRequest {
 #[derive(Debug, Clone)]
 pub struct RaftClient {
     sender: mpsc::Sender<RaftClientRequest>,
+    cluster: ClusterClient,
+    config: Config,
 }
 
 impl RaftClient {
-    pub fn new() -> (Self, mpsc::Receiver<RaftClientRequest>) {
-        let (tx, rx) = mpsc::channel(128);
-        return (Self { sender: tx }, rx);
-    }
     pub async fn leader(&self) -> anyhow::Result<Option<NodeId>> {
         let (tx, rx) = oneshot::channel();
         let req = RaftClientRequest::QueryLeader { response: tx };
@@ -382,17 +380,27 @@ impl RaftClient {
     pub async fn self_is_leader(&self, config: Config) -> anyhow::Result<bool> {
         let leader = self.leader().await?;
         let leader_is_self = leader
-            .map(|leader| leader == config.cluster_config.own_node_id)
+            .map(|leader| leader == config.cluster.own_node_id)
             .unwrap_or(false);
 
         Ok(leader_is_self)
     }
 }
 
+impl From<Config> for RaftClient {
+    fn from(value: Config) -> Self {
+        Self {
+            sender: value.clone().raft.client,
+            cluster: value.clone().into(),
+            config: value.clone(),
+        }
+    }
+}
+
 async fn handle_raft_client_request(
     req: RaftClientRequest,
-    transport: &impl Transport,
-    config: Config,
+    _transport: &impl Transport,
+    _config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
     match req {
@@ -402,7 +410,7 @@ async fn handle_raft_client_request(
                 State::Observer { leader, .. } => leader.to_owned(),
             };
 
-            response.send(leader);
+            let _ = response.send(leader);
 
             Ok(())
         }

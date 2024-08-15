@@ -11,6 +11,7 @@ use tokio::time::{self, Instant};
 
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
+    pub client: mpsc::Sender<ClusterClientRequest>,
     pub cluster_heartbeat: Duration,
     pub own_node_id: NodeId,
     pub own_region: String,
@@ -49,30 +50,25 @@ struct NodeState {
 
 pub async fn run_node(
     transport: &impl Transport,
-    config: &mut broadcast::Receiver<Config>,
-    client_sender: oneshot::Sender<ClusterClient>,
+    config: Config,
+    client_rx: &mut mpsc::Receiver<ClusterClientRequest>,
 ) -> anyhow::Result<()> {
-    let (client, mut client_rx) = ClusterClient::new();
-    client_sender.send(client).unwrap();
-
-    let config = config.recv().await.unwrap();
-
     let mut state = State {
         local_node: LocalNode {
-            id: config.cluster_config.own_node_id.to_owned(),
+            id: config.cluster.own_node_id.to_owned(),
             state: NodeState {
                 last_seen: SystemTime::now(),
-                raft_voter: config.raft_config.raft_voter.to_owned(),
-                region: config.cluster_config.own_region.to_owned(),
-                dc: config.cluster_config.own_dc.to_owned(),
-                meta: config.cluster_config.own_meta.to_owned(),
+                raft_voter: config.raft.raft_voter.to_owned(),
+                region: config.cluster.own_region.to_owned(),
+                dc: config.cluster.own_dc.to_owned(),
+                meta: config.cluster.own_meta.to_owned(),
                 version: 0,
             },
         },
         nodes: HashMap::new(),
     };
 
-    let mut interval = time::interval(config.cluster_config.cluster_heartbeat);
+    let mut interval = time::interval(config.cluster.cluster_heartbeat);
 
     loop {
         let _ = tokio::select! {
@@ -210,11 +206,11 @@ async fn handle_heartbeat(
     let digest = state.generate_cluster_digest();
 
     let mut seed_nodes: Vec<_> = config
-        .cluster_config
+        .cluster
         .seed_nodes
         .iter()
         .cloned()
-        .choose_multiple(&mut rng, config.cluster_config.seeds_to_ping);
+        .choose_multiple(&mut rng, config.cluster.seeds_to_ping);
 
     let mut suspicious_nodes: Vec<_> = state
         .nodes
@@ -224,7 +220,7 @@ async fn handle_heartbeat(
             let suspicious = SystemTime::now()
                 .duration_since(node_data.last_seen)
                 .ok()
-                .map(|duration| duration.gt(&config.cluster_config.suspicious_timeout))
+                .map(|duration| duration.gt(&config.cluster.suspicious_timeout))
                 .unwrap_or(true);
 
             match suspicious {
@@ -232,13 +228,13 @@ async fn handle_heartbeat(
                 true => Some(id.clone()),
             }
         })
-        .choose_multiple(&mut rng, config.cluster_config.sus_to_ping);
+        .choose_multiple(&mut rng, config.cluster.sus_to_ping);
 
     let mut regular_nodes: Vec<_> = state
         .nodes
         .keys()
         .cloned()
-        .choose_multiple(&mut rng, config.cluster_config.nodes_to_ping);
+        .choose_multiple(&mut rng, config.cluster.nodes_to_ping);
 
     nodes.append(&mut seed_nodes);
     nodes.append(&mut suspicious_nodes);
@@ -333,13 +329,10 @@ async fn handle_client_request(
 #[derive(Debug, Clone)]
 pub struct ClusterClient {
     sender: mpsc::Sender<ClusterClientRequest>,
+    config: Config,
 }
 
 impl ClusterClient {
-    pub fn new() -> (Self, mpsc::Receiver<ClusterClientRequest>) {
-        let (tx, rx) = mpsc::channel(128);
-        return (Self { sender: tx }, rx);
-    }
     pub async fn list_raft_nodes(&self) -> anyhow::Result<Vec<NodeId>> {
         let (tx, rx) = oneshot::channel();
         let req = ClusterClientRequest::ListRaftNodes { respond: tx };
@@ -366,5 +359,14 @@ impl ClusterClient {
         let response = rx.await?;
 
         return Ok(response);
+    }
+}
+
+impl From<Config> for ClusterClient {
+    fn from(value: Config) -> Self {
+        Self {
+            sender: value.clone().cluster.client,
+            config: value.clone(),
+        }
     }
 }

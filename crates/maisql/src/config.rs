@@ -1,18 +1,24 @@
-use tokio::sync::{broadcast, mpsc, oneshot};
-
 use crate::{
     cluster::{ClusterClient, ClusterConfig},
     locks::{LocksClient, LocksConfig},
     raft::{RaftClient, RaftConfig},
-    transport::Transport,
 };
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub cluster_config: ClusterConfig,
-    pub cluster_client: ClusterClient,
-    pub raft_config: RaftConfig,
-    pub raft_client: RaftClient,
-    pub locks_config: LocksConfig,
-    pub locks_client: LocksClient,
+    pub cluster: ClusterConfig,
+    pub raft: RaftConfig,
+    pub locks: LocksConfig,
+}
+
+impl Config {
+    pub fn cluster_client(&self) -> ClusterClient {
+        self.clone().into()
+    }
+    pub fn raft_client(&self) -> RaftClient {
+        self.clone().into()
+    }
+    pub fn locks_client(&self) -> LocksClient {
+        self.clone().into()
+    }
 }

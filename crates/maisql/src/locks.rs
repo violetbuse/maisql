@@ -8,17 +8,20 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{self, Digest, Sha256};
 use tokio::{
-    sync::{broadcast, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     time::{self, Instant},
 };
 
 use crate::{
+    cluster::ClusterClient,
     config::Config,
+    raft::RaftClient,
     transport::{NodeId, Transport, TransportData},
 };
 
 #[derive(Debug, Clone)]
 pub struct LocksConfig {
+    pub client: mpsc::Sender<LocksClientRequest>,
     lock_default_timeout: Duration,
     /// This mainly controls how often replicas try to sync with the leader.
     lock_service_heartbeat: Duration,
@@ -44,7 +47,7 @@ pub struct SnapshotDigest {
 }
 
 impl SnapshotDigest {
-    pub fn replicated(&self, leader: &Snapshot) -> u128 {
+    fn replicated(&self, leader: &Snapshot) -> u128 {
         let leader_checksum = leader.generate_entries_checksum(Some(self.entry_id));
         if leader_checksum != self.entry_checksum {
             return 0;
@@ -55,7 +58,7 @@ impl SnapshotDigest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SnapshotDelta {
+enum SnapshotDelta {
     FullSnapshot(Snapshot),
     AppendEntries(NextEntry),
     DeleteEntries(u128),
@@ -451,7 +454,6 @@ impl NextEntry {
                 });
 
                 let internal = mem::replace(entry, dummy_entry);
-                drop(entry);
 
                 *curr = Self::Committed(internal);
             }
@@ -506,7 +508,7 @@ enum EntryType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Lock {
+pub struct Lock {
     pub holder: NodeId,
     pub expires: SystemTime,
     pub data: String,
@@ -514,14 +516,9 @@ struct Lock {
 
 pub async fn run_locks(
     transport: &impl Transport,
-    config: &mut broadcast::Receiver<Config>,
-    client_sender: oneshot::Sender<LocksClient>,
+    config: Config,
+    client_rx: &mut mpsc::Receiver<LocksClientRequest>,
 ) -> anyhow::Result<()> {
-    let (client, mut client_rx) = LocksClient::new();
-    client_sender.send(client);
-
-    let config = config.recv().await.unwrap();
-
     let mut state = State {
         current_snapshot: Snapshot {
             id: 0,
@@ -530,8 +527,8 @@ pub async fn run_locks(
         },
         follower_digests: HashMap::new(),
     };
-    let mut heartbeat = time::interval(config.locks_config.lock_service_heartbeat);
-    let mut compaction = time::interval(config.locks_config.compaction_interval);
+    let mut heartbeat = time::interval(config.locks.lock_service_heartbeat);
+    let mut compaction = time::interval(config.locks.compaction_interval);
 
     loop {
         let _ = tokio::select! {
@@ -565,7 +562,7 @@ async fn handle_transport_data(
 ) -> anyhow::Result<()> {
     let message = LocksMessage::parse(bytes, "locks_message")?;
     let is_leader = config
-        .raft_client
+        .raft_client()
         .self_is_leader(config.to_owned())
         .await
         .unwrap_or(false);
@@ -588,7 +585,7 @@ async fn handle_message_as_leader(
     let new_entry: Option<EntryType> = match message {
         LocksMessage::AquireLock { resource, data } => {
             if let None = current_state.get(&resource) {
-                let expires = SystemTime::now() + config.locks_config.lock_default_timeout;
+                let expires = SystemTime::now() + config.locks.lock_default_timeout;
                 Some(EntryType::AquireLock {
                     resource,
                     holder: from,
@@ -602,8 +599,7 @@ async fn handle_message_as_leader(
         LocksMessage::RenewLock { resource } => {
             if let Some(lock) = current_state.get(&resource) {
                 if lock.holder == from {
-                    let new_expiration =
-                        SystemTime::now() + config.locks_config.lock_default_timeout;
+                    let new_expiration = SystemTime::now() + config.locks.lock_default_timeout;
                     Some(EntryType::RenewLock {
                         resource,
                         new_expiration,
@@ -641,11 +637,11 @@ async fn handle_message_as_leader(
             state.follower_digests.insert(from.clone(), digest.clone());
             let delta = state.current_snapshot.generate_delta(digest);
             let message = LocksMessage::Delta(delta);
-            transport
+            let _ = transport
                 .send_unreliable(from, &message.serialize_for_send())
                 .await;
 
-            handle_commit_calculations(transport, config, state).await;
+            let _ = handle_commit_calculations(transport, config, state).await;
 
             None
         }
@@ -666,7 +662,7 @@ async fn handle_message_as_replica(
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
-    let leader = config.raft_client.leader().await?;
+    let leader = config.raft_client().leader().await?;
 
     match message {
         LocksMessage::Delta(delta) => {
@@ -686,9 +682,9 @@ async fn handle_heartbeat(
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
-    let leader = config.raft_client.leader().await?;
+    let leader = config.raft_client().leader().await?;
 
-    if leader == Some(config.cluster_config.own_node_id) {
+    if leader == Some(config.cluster.own_node_id) {
         let current_state = state.current_snapshot.proposed_state();
         let expired_locks = current_state
             .iter()
@@ -725,7 +721,7 @@ async fn handle_commit_calculations(
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
-    let raft_nodes = config.cluster_client.list_raft_nodes().await?;
+    let raft_nodes = config.cluster_client().list_raft_nodes().await?;
 
     let checkpoints = state
         .follower_digests
@@ -746,7 +742,7 @@ async fn handle_commit_calculations(
     }
 
     let min_replications_to_commit = (raft_nodes.len() as f64
-        * config.locks_config.entry_commit_minimum_replication_ratio)
+        * config.locks.entry_commit_minimum_replication_ratio)
         .ceil() as u32;
     let mut committable_entries: Vec<_> = checkpoint_counts
         .iter()
@@ -807,14 +803,14 @@ async fn handle_client_request(
     config: Config,
     state: &mut State,
 ) -> anyhow::Result<()> {
-    let leader = config.raft_client.leader().await.ok().flatten();
+    let leader = config.raft_client().leader().await.ok().flatten();
 
     match req {
         LocksClientRequest::GetLock { resource, response } => {
             let locks = state.current_snapshot.committed_state();
             let lock = locks.get(&resource).map(|lock| lock.to_owned());
 
-            response.send(lock);
+            let _ = response.send(lock);
             Ok(())
         }
         LocksClientRequest::AquireLock { resource, data } => {
@@ -862,14 +858,13 @@ async fn handle_client_request(
 #[derive(Debug, Clone)]
 pub struct LocksClient {
     sender: mpsc::Sender<LocksClientRequest>,
+    _cluster_client: ClusterClient,
+    _raft_client: RaftClient,
+    config: Config,
 }
 
 impl LocksClient {
-    pub fn new() -> (Self, mpsc::Receiver<LocksClientRequest>) {
-        let (tx, rx) = mpsc::channel(128);
-        return (Self { sender: tx }, rx);
-    }
-    pub async fn lock_info(&self, resource: String) -> anyhow::Result<Option<Lock>> {
+    async fn lock_info(&self, resource: String) -> anyhow::Result<Option<Lock>> {
         let (tx, rx) = oneshot::channel();
         let req = LocksClientRequest::GetLock {
             resource,
@@ -881,20 +876,121 @@ impl LocksClient {
 
         Ok(result)
     }
-    pub async fn aquire_lock(&self, resource: String, data: String) {
+    async fn aquire_lock(&self, resource: String, data: String) {
         let req = LocksClientRequest::AquireLock { resource, data };
-        self.sender.send(req).await;
+        let _ = self.sender.send(req).await;
     }
-    pub async fn renew_lock(&self, resource: String) {
+    async fn renew_lock(&self, resource: String) {
         let req = LocksClientRequest::RenewLock { resource };
-        self.sender.send(req).await;
+        let _ = self.sender.send(req).await;
     }
-    pub async fn modify_lock(&self, resource: String, data: String) {
+    async fn _modify_lock(&self, resource: String, data: String) {
         let req = LocksClientRequest::UpdateLockData { resource, data };
-        self.sender.send(req).await;
+        let _ = self.sender.send(req).await;
     }
-    pub async fn release_lock(&self, resource: String) {
+    async fn release_lock(&self, resource: String) {
         let req = LocksClientRequest::ReleaseLock { resource };
-        self.sender.send(req).await;
+        let _ = self.sender.send(req).await;
+    }
+    pub fn lock(&self, resource: String, lock_renew_interval: Duration) -> LockHandle {
+        let (tx, mut rx) = mpsc::channel::<LockHandleRequest>(32);
+
+        let int_resource = resource.clone();
+        let int_lock_renew_interval = lock_renew_interval.clone();
+        let int_config = self.config.clone();
+
+        tokio::spawn(async move {
+            let resource = int_resource;
+
+            let mut try_to_lock = false;
+            let mut renew_interval = time::interval(int_lock_renew_interval);
+            let config = int_config;
+
+            let lock_client: LocksClient = config.clone().into();
+            let _raft_client: RaftClient = config.clone().into();
+
+            loop {
+                let _ = tokio::select! {
+                    Some(req) = rx.recv() => {
+                        match req {
+                            LockHandleRequest::Lock => {
+                                try_to_lock = true;
+                            }
+                            LockHandleRequest::Unlock => {
+                                try_to_lock = false;
+                            }
+                            LockHandleRequest::IsLocked(res) => {
+                                let lock = lock_client.lock_info(resource.clone()).await.ok().flatten();
+                                let is_locked_locally = lock.map(|lock| lock.holder == config.cluster.own_node_id).unwrap_or(false);
+
+                                let _ = res.send(is_locked_locally);
+                            }
+                        }
+                    },
+                    _ = renew_interval.tick() => {
+                        let lock = lock_client.lock_info(resource.clone()).await.ok().flatten();
+                        let is_locked_locally = lock.map(|lock| lock.holder == config.cluster.own_node_id).unwrap_or(false);
+
+                        match try_to_lock {
+                            true => {
+                                if is_locked_locally {
+                                    lock_client.aquire_lock(resource.clone(), "".to_string()).await;
+                                } else {
+                                    lock_client.renew_lock(resource.clone()).await;
+                                }
+                            }
+                            false => {
+                                if is_locked_locally {
+                                    lock_client.release_lock(resource.clone()).await;
+                                }
+                            }
+                        };
+                    }
+                };
+            }
+        });
+
+        LockHandle {
+            sender: tx,
+            _resource: resource.clone(),
+        }
+    }
+}
+
+impl From<Config> for LocksClient {
+    fn from(value: Config) -> Self {
+        Self {
+            sender: value.clone().locks.client,
+            _cluster_client: value.clone().into(),
+            _raft_client: value.clone().into(),
+            config: value.clone(),
+        }
+    }
+}
+
+enum LockHandleRequest {
+    Lock,
+    Unlock,
+    IsLocked(oneshot::Sender<bool>),
+}
+
+pub struct LockHandle {
+    sender: mpsc::Sender<LockHandleRequest>,
+    _resource: String,
+}
+
+impl LockHandle {
+    pub async fn lock(&self) {
+        self.sender.send(LockHandleRequest::Lock).await;
+    }
+    pub async fn is_locked(&self) -> anyhow::Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.sender.send(LockHandleRequest::IsLocked(tx));
+        let result = rx.await?;
+
+        Ok(result)
+    }
+    pub async fn unlock(&self) {
+        self.sender.send(LockHandleRequest::Unlock).await;
     }
 }

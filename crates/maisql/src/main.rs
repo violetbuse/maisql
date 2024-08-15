@@ -1,9 +1,8 @@
-mod cluster;
-mod config;
-mod locks;
-mod manager;
-mod raft;
-mod transport;
+pub mod cluster;
+pub mod config;
+pub mod locks;
+pub mod raft;
+pub mod transport;
 
 fn main() {
     println!("Hello, world!");
