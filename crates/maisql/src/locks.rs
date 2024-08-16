@@ -921,9 +921,10 @@ impl LocksClient {
                             }
                             LockHandleRequest::IsLocked(res) => {
                                 let lock = lock_client.lock_info(resource.clone()).await.ok().flatten();
-                                let is_locked_locally = lock.map(|lock| lock.holder == config.cluster.own_node_id).unwrap_or(false);
+                                let is_locked_locally = lock.clone().map(|lock| lock.holder == config.cluster.own_node_id).unwrap_or(false);
+                                let lock_has_not_expired = lock.clone().map(|lock| lock.expires > SystemTime::now()).unwrap_or(false);
 
-                                let _ = res.send(is_locked_locally);
+                                let _ = res.send(is_locked_locally && lock_has_not_expired);
                             }
                         }
                     },
