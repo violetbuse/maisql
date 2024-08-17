@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io::Cursor};
 
 use anyhow::anyhow;
-use byteorder::{BigEndian, ReadBytesExt};
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,11 +64,11 @@ pub fn parse_wal(bytes: &[u8]) -> anyhow::Result<TransactionSet> {
         let mut prev_frames: Vec<(u32, WalFrameHeader, Page)> = Vec::new();
 
         loop {
-            if cursor.position() + 1 == bytes.len() {
+            if cursor.position() as usize + 1 == bytes.len() {
                 break;
             }
 
-            let offset = 32 + current_frame * (24 + header.page_size);
+            let offset: usize = 32 + current_frame as usize * (24 + header.page_size as usize);
 
             let page_no = ReadBytesExt::read_u32::<BigEndian>(&mut cursor)?;
 
@@ -84,13 +84,17 @@ pub fn parse_wal(bytes: &[u8]) -> anyhow::Result<TransactionSet> {
             let checksum_1 = ReadBytesExt::read_u32::<BigEndian>(&mut cursor)?;
             let checksum_2 = ReadBytesExt::read_u32::<BigEndian>(&mut cursor)?;
 
-            let (prev_check_1, prev_check_2) = match prev_frames {
+            let (prev_check_1, prev_check_2) = match prev_frames[..] {
                 [.., (_, header, _)] => (header.checksum_1, header.checksum_2),
                 [] => (header.checksum_1, header.checksum_2),
             };
 
-            let checksummed_header_bytes = &bytes[offset..(offset + 8)];
-            let page_bytes = &bytes[(offset + 24)..(offset + 24 + header.page_size)];
+            let header_end = offset + 8;
+            let page_start = offset + 24;
+            let page_end = page_start + header.page_size as usize;
+
+            let checksummed_header_bytes = &bytes[offset..header_end];
+            let page_bytes = &bytes[page_end..page_end];
 
             let (s1, s2) = checksum(
                 header.endianness,
@@ -128,12 +132,12 @@ pub fn parse_wal(bytes: &[u8]) -> anyhow::Result<TransactionSet> {
         modified_pages: HashMap::new(),
     }];
 
-    while let Some((frame_id, frame_header, page)) = wal_frames.iter().next() {
+    while let Some((_frame_id, frame_header, page)) = wal_frames.iter().next() {
         transactions
             .last_mut()
             .unwrap()
             .modified_pages
-            .insert(frame_header.page_no, page);
+            .insert(frame_header.page_no, page.to_owned());
 
         if frame_header.is_commit_rec.is_some() {
             transactions.push(Transaction {
@@ -154,21 +158,33 @@ fn checksum(endianness: Endianness, bytes: &[u8], s0: u32, s1: u32) -> (u32, u32
     let mut s0 = s0;
     let mut s1 = s1;
 
-    let cursor = Cursor::new(bytes);
+    let mut cursor = Cursor::new(bytes);
+    let mut ints: Vec<u32> = vec![0; bytes.len() / 4];
 
-    for i in (0..(bytes.len() - 1)).step_by(2) {
-        s0 += bytes[i] + s1;
-        s1 += bytes[i + 1] + s0;
+    match endianness {
+        Endianness::BigEndian => {
+            cursor.read_u32_into::<BigEndian>(&mut ints);
+        }
+        Endianness::LittleEndian => {
+            cursor.read_u32_into::<LittleEndian>(&mut ints);
+        }
+    }
+
+    for i in (0..(ints.len() - 1)).step_by(2) {
+        s0 += ints[i] + s1;
+        s1 += ints[i + 1] + s0;
     }
 
     (s0, s1)
 }
 
+#[derive(Debug, Clone, Copy)]
 enum Endianness {
     BigEndian,
     LittleEndian,
 }
 
+#[derive(Debug, Clone, Copy)]
 struct WalHeader {
     endianness: Endianness,
     page_size: u32,
@@ -179,6 +195,7 @@ struct WalHeader {
     checksum_2: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
 struct WalFrameHeader {
     page_no: u32,
     /// If this is a commit record, Some(u32) otherwise None
