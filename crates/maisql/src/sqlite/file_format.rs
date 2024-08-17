@@ -15,5 +15,7 @@ pub struct DatabaseHeader {
 
 impl TryFrom<&[u8]> for DatabaseHeader {
     type Error = anyhow::Error;
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {}
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        todo!()
+    }
 }
