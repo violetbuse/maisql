@@ -2,7 +2,7 @@ use crate::{
     cluster::{ClusterClient, ClusterConfig},
     locks::{LocksClient, LocksConfig},
     raft::{RaftClient, RaftConfig},
-    sqlite::{SqliteClient, SqliteConfig},
+    sqlite::{db_registry::DbRegistryConfig, SqliteClient, SqliteConfig},
 };
 
 #[derive(Debug, Clone)]
@@ -10,6 +10,7 @@ pub struct Config {
     pub cluster: ClusterConfig,
     pub raft: RaftConfig,
     pub locks: LocksConfig,
+    pub db_registry: DbRegistryConfig,
     pub sqlite: SqliteConfig,
 }
 
@@ -24,6 +25,9 @@ impl Config {
         self.clone().into()
     }
     pub fn sqlite_client(&self) -> SqliteClient {
+        self.clone().into()
+    }
+    pub fn db_registry_client(&self) -> DbRegistryConfig {
         self.clone().into()
     }
 }

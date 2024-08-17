@@ -1,9 +1,9 @@
-use std::{ffi::c_int, path::PathBuf};
+use std::ffi::c_int;
 
 use fuser::{BackgroundSession, Filesystem};
-use tokio::{runtime::Handle, sync::mpsc};
+use tokio::runtime::Handle;
 
-use crate::{config::Config, transport::Transport};
+use crate::config::Config;
 
 #[derive(Debug)]
 pub struct SqliteFuse {

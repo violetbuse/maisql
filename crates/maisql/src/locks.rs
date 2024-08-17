@@ -892,8 +892,11 @@ impl LocksClient {
         let req = LocksClientRequest::ReleaseLock { resource };
         let _ = self.sender.send(req).await;
     }
-    pub fn lock(&self, resource: String, lock_renew_interval: Duration) -> LockHandle {
+    pub fn lock(&self, resource: String, lock_renew_interval: Option<Duration>) -> LockHandle {
         let (tx, mut rx) = mpsc::channel::<LockHandleRequest>(32);
+
+        let lock_renew_interval =
+            lock_renew_interval.unwrap_or(self.config.locks.lock_default_timeout / 3);
 
         let int_resource = resource.clone();
         let int_lock_renew_interval = lock_renew_interval.clone();
@@ -975,6 +978,7 @@ enum LockHandleRequest {
     IsLocked(oneshot::Sender<bool>),
 }
 
+#[derive(Debug, Clone)]
 pub struct LockHandle {
     sender: mpsc::Sender<LockHandleRequest>,
     _resource: String,

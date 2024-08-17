@@ -1,4 +1,3 @@
-use anyhow::anyhow;
 
 pub enum DatabaseMode {
     Journal,
