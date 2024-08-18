@@ -1,12 +1,23 @@
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use core::str;
-use std::io::{Cursor, Read, Write};
+use futures::stream::{iter, SelectNextSome};
+use std::{
+    array,
+    collections::HashMap,
+    hash::Hash,
+    io::{Cursor, Read, Write},
+    iter,
+};
 
 use anyhow::anyhow;
 use byteorder::BigEndian;
 use tokio::sync::mpsc;
 
-use crate::{config::Config, filesystem::Storage, transport::Transport};
+use crate::{
+    config::Config,
+    filesystem::{self, Storage},
+    transport::Transport,
+};
 
 #[derive(Debug, Clone)]
 pub struct KvConfig {
@@ -14,6 +25,35 @@ pub struct KvConfig {
 }
 
 struct State {}
+
+struct KvInstance {
+    filename: String,
+}
+
+impl KvInstance {
+    pub async fn create_new(filename: String, filesystem: &impl Storage) -> anyhow::Result<Self> {
+        let free_pages_data: Vec<u8> = vec![0; 20 * 4096];
+        let free_pages: [u32; 20] = array::from_fn(|i| i as u32 + 1);
+
+        let header = Header {
+            root_page: 0,
+            free_pages,
+        };
+
+        let root_page = Page::RootPage { entries: None };
+
+        header.write_header(filename.clone(), filesystem).await?;
+        root_page
+            .write_page(filename.clone(), filesystem, 0)
+            .await?;
+
+        filesystem
+            .write(filename.clone(), 100 + 4096, free_pages_data)
+            .await?;
+
+        Ok(Self { filename })
+    }
+}
 
 struct Header {
     root_page: u32,
@@ -67,9 +107,19 @@ impl Header {
 }
 
 enum Page {
-    RootPage {},
-    BranchPage { parent_page: u32 },
-    LeafPage { parent_page: u32 },
+    RootPage {
+        entries: Option<(u32, Vec<(String, u32, String)>)>,
+    },
+    BranchPage {
+        parent_page: u32,
+        first_child_pointer: u32,
+        entries: Vec<(String, u32, String)>,
+    },
+    LeafPage {
+        parent_page: u32,
+        first_child_pointer: u32,
+        entries: Vec<(String, String)>,
+    },
 }
 
 impl Page {
@@ -84,9 +134,9 @@ impl Page {
         let mut cursor = Cursor::new(bytes);
 
         let page_type = cursor.read_u8()?;
-        let parent_cursor = cursor.read_u32::<BigEndian>();
+        let parent_page = cursor.read_u32::<BigEndian>()?;
 
-        let lt_child_pointer = cursor.read_u32::<BigEndian>();
+        let first_child_pointer = cursor.read_u32::<BigEndian>()?;
 
         let mut entries: Vec<(String, u32, String)> = Vec::new();
 
@@ -125,13 +175,110 @@ impl Page {
         }
 
         let page = match page_type {
-            0 => Page::RootPage {},
-            1 => Page::BranchPage {},
-            2 => Page::LeafPage {},
+            0 => Page::RootPage {
+                entries: Some((first_child_pointer, entries)),
+            },
+            1 => Page::RootPage { entries: None },
+            2 => Page::BranchPage {
+                parent_page,
+                first_child_pointer,
+                entries,
+            },
+            3 => Page::LeafPage {
+                parent_page,
+                first_child_pointer,
+                entries: entries
+                    .into_iter()
+                    .map(|(key, _child, value)| (key, value))
+                    .collect(),
+            },
             invalid => return Err(anyhow!("invalid kv page type {invalid}")),
         };
 
         Ok(page)
+    }
+    pub async fn write_page(
+        self,
+        filename: String,
+        storage: &impl Storage,
+        page_id: u32,
+    ) -> anyhow::Result<()> {
+        let mut data: [u8; 4096] = [0; 4096];
+        let mut cursor = Cursor::new(&mut data[..]);
+
+        let page_type: u8 = match &self {
+            Page::RootPage { entries: None } => 0,
+            Page::RootPage { entries: Some(..) } => 1,
+            Page::BranchPage { .. } => 2,
+            Page::LeafPage { .. } => 3,
+        };
+
+        cursor.write_u8(page_type)?;
+
+        match &self {
+            Page::BranchPage { parent_page, .. } | Page::LeafPage { parent_page, .. } => {
+                cursor.write_u32::<BigEndian>(parent_page.to_owned())?;
+            }
+            Page::RootPage { .. } => {}
+        };
+
+        let lt_pointer: u32 = match &self {
+            Page::RootPage {
+                entries: Some((lt_pointer, _)),
+            }
+            | Page::BranchPage {
+                first_child_pointer: lt_pointer,
+                ..
+            }
+            | Page::LeafPage {
+                first_child_pointer: lt_pointer,
+                ..
+            } => lt_pointer.to_owned(),
+            _ => 0,
+        };
+
+        cursor.write_u32::<BigEndian>(lt_pointer)?;
+
+        let entries: Vec<(String, u32, String)> = match &self {
+            Page::RootPage { entries: None } => Vec::new(),
+            Page::RootPage {
+                entries: Some((_, entries)),
+            }
+            | Page::BranchPage { entries, .. } => entries.to_owned(),
+            Page::LeafPage { entries, .. } => entries
+                .iter()
+                .cloned()
+                .map(|(key, value)| (key, 0, value))
+                .collect(),
+        };
+
+        for (key, pointer, value) in entries {
+            let key_bytes: [u8; 32] = key
+                .bytes()
+                .chain(iter::repeat(0))
+                .take(32)
+                .collect::<Vec<_>>()
+                .try_into()
+                .map_err(|_| anyhow!("could not truncate key into 32 bytes"))?;
+
+            let value_bytes: [u8; 32] = value
+                .bytes()
+                .chain(iter::repeat(0))
+                .take(66)
+                .collect::<Vec<_>>()
+                .try_into()
+                .map_err(|_| anyhow!("could not truncate value into 0 bytes"))?;
+
+            cursor.write(&key_bytes[..])?;
+            cursor.write_u32::<BigEndian>(pointer)?;
+            cursor.write(&value_bytes[..])?;
+        }
+
+        let offset: u32 = 100 + page_id * 4096;
+
+        storage.write(filename, offset, data.to_vec()).await?;
+
+        Ok(())
     }
 }
 

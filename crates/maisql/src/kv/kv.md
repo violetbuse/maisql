@@ -10,7 +10,7 @@ All bytes are encoded as big endian.
 
 # Kv File Page Format
 
-|page_type 1-byte; 0 if root; 1 if branch; 2 if leaf;|
+|page_type 1-byte; 0 if empty root; 1 if root; 2 if branch; 3 if leaf;|
 |parent_page 4-byte|
 |lt child pointer 4 byte|
 40 key | cursor | value tuples
