@@ -1,6 +1,11 @@
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use core::str;
-use futures::stream::{iter, SelectNextSome};
+use fuser::Filesystem;
+use futures::{
+    future::BoxFuture,
+    stream::{iter, SelectNextSome},
+    FutureExt,
+};
 use std::{
     array,
     collections::HashMap,
@@ -123,11 +128,60 @@ enum Page {
 }
 
 impl Page {
-    pub async fn read_page(
+    pub fn read_key<F>(
+        &self,
+        key: String,
         filename: String,
-        page: u32,
-        storage: &impl Storage,
-    ) -> anyhow::Result<Self> {
+        filesystem: &F,
+    ) -> BoxFuture<anyhow::Result<Option<String>>>
+    where
+        F: Storage,
+    {
+        async {
+            match self {
+                Page::LeafPage { entries, .. } => {
+                    return Ok(entries.iter().find_map(|(entry_key, value)| {
+                        if key == *entry_key {
+                            Some(value.clone())
+                        } else {
+                            None
+                        }
+                    }));
+                }
+                Page::RootPage { entries: None } => return Ok(None),
+                Page::RootPage {
+                    entries: Some((lt_ptr, entries)),
+                }
+                | Page::BranchPage {
+                    parent_page: _,
+                    first_child_pointer: lt_ptr,
+                    entries,
+                } => {
+                    let mut child_pointer = lt_ptr;
+
+                    for (entry_key, gt_ptr, value) in entries {
+                        if *entry_key == key {
+                            return Ok(Some(value.clone()));
+                        } else if *entry_key > key {
+                            break;
+                        } else {
+                            child_pointer = gt_ptr;
+                        }
+                    }
+
+                    let child_page = Page::read_page(filename, *child_pointer, filesystem).await?;
+                    let read_key = child_page.read_key(key, filename, filesystem).await?;
+
+                    return Ok(read_key);
+                }
+            }
+        }
+        .boxed()
+    }
+    pub async fn read_page<F>(filename: String, page: u32, storage: &F) -> anyhow::Result<Self>
+    where
+        F: Storage,
+    {
         let page_size: u32 = 2 ^ 12;
         let offset = 100 + page * page_size;
         let bytes = storage.read(filename, offset, page_size).await?;
