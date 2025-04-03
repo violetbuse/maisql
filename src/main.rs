@@ -1,5 +1,6 @@
 mod cluster;
 mod db;
+mod election;
 use anyhow::Result;
 use clap::Parser;
 use cluster::Cluster;
