@@ -1,4 +1,5 @@
 mod db;
+mod cluster;
 use db::{Block, DatabaseManager};
 use std::path::PathBuf;
 use anyhow::Result;
@@ -34,6 +35,6 @@ async fn main() -> Result<()> {
 
     db_manager.add_database("backup", PathBuf::from("backup.db")).await?;
     db_manager.initialize_database("backup").await?;
-    
+
     Ok(())
 }
