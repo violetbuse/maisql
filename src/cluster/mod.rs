@@ -1,0 +1,153 @@
+pub mod client;
+use anyhow::Result;
+use futures_util::stream::StreamExt;
+use futures_util::FutureExt;
+use futures_util::SinkExt;
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
+use tokio::select;
+use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::protocol::Message;
+
+#[derive(Clone)]
+pub struct Cluster {
+    command_tx: mpsc::Sender<ClusterCommand>,
+}
+
+#[derive(Debug)]
+pub struct ClusterState {
+    command_rx: mpsc::Receiver<ClusterCommand>,
+    connections: Vec<(
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        std::net::SocketAddr,
+    )>,
+}
+
+#[derive(Debug)]
+pub enum ClusterCommand {
+    Ping(oneshot::Sender<Result<()>>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClusterRequest {
+    #[serde(rename = "request_id")]
+    id: u64,
+    from: SocketAddr,
+    data: ClusterRequestData,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ClusterRequestData {
+    Ping,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClusterResponse {
+    #[serde(rename = "response_id")]
+    id: u64,
+    from: SocketAddr,
+    data: ClusterResponseData,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ClusterResponseData {
+    Pong,
+}
+
+impl Cluster {
+    pub fn new(socket_addr: SocketAddr) -> Self {
+        let (command_tx, command_rx) = mpsc::channel(32);
+
+        let state = ClusterState {
+            command_rx,
+            connections: Vec::new(),
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = Self::run(state, socket_addr).await {
+                eprintln!("Cluster run encountered an error: {}", e);
+                std::process::exit(1);
+            }
+        });
+
+        Self { command_tx }
+    }
+
+    async fn run(state: ClusterState, socket_addr: SocketAddr) -> Result<()> {
+        let mut state = state;
+
+        let listener = TcpListener::bind(socket_addr).await?;
+        println!("Cluster listening on {}", listener.local_addr()?);
+
+        loop {
+            // Use a non-blocking select! with a timeout
+            select! {
+                Some(command) = state.command_rx.recv() => {
+                    match command {
+                        ClusterCommand::Ping(response) => {
+                            response.send(Ok(())).unwrap();
+                        }
+                    }
+                },
+                Ok((stream, addr)) = listener.accept() => {
+                    if let Err(e) = Self::handle_connection(&mut state, stream, addr).await {
+                        eprintln!("Error handling connection: {}", e);
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    // Process WebSocket messages
+                    let mut to_remove = Vec::new();
+                    for (i, (ws_stream, addr)) in state.connections.iter_mut().enumerate() {
+                        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+                        match ws_receiver.next().now_or_never() {
+                            Some(Some(Ok(msg))) => {
+                                if msg.is_text() {
+                                    if let Ok(request) =
+                                        serde_json::from_str::<ClusterRequest>(msg.to_text()?)
+                                    {
+                                        match request.data {
+                                            ClusterRequestData::Ping => {
+                                                let response = ClusterResponse {
+                                                    id: request.id,
+                                                    from: *addr,
+                                                    data: ClusterResponseData::Pong,
+                                                };
+                                                let response_text = serde_json::to_string(&response)?;
+                                                ws_sender.send(Message::Text(response_text)).await?;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Some(Some(Err(_))) | Some(None) => {
+                                // Connection closed or error occurred, mark for removal
+                                to_remove.push(i);
+                            }
+                            None => {} // No message ready yet
+                        }
+                    }
+
+                    // Remove closed connections
+                    for &i in to_remove.iter().rev() {
+                        state.connections.remove(i);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_connection(
+        state: &mut ClusterState,
+        stream: tokio::net::TcpStream,
+        addr: std::net::SocketAddr,
+    ) -> Result<()> {
+        let ws_stream = accept_async(stream).await?;
+        state.connections.push((ws_stream, addr));
+        Ok(())
+    }
+}
