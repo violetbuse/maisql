@@ -5,11 +5,12 @@ use futures_util::FutureExt;
 use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::WebSocketStream;
 
 #[derive(Clone)]
 pub struct Cluster {
@@ -39,8 +40,10 @@ pub struct ClusterRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "content")]
 pub enum ClusterRequestData {
     Ping,
+    UpdateAddress(SocketAddr),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,8 +55,10 @@ pub struct ClusterResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "content")]
 pub enum ClusterResponseData {
     Pong,
+    AddressUpdated,
 }
 
 impl Cluster {
@@ -75,6 +80,52 @@ impl Cluster {
         Self { command_tx }
     }
 
+    async fn handle_ping_request(
+        mut ws_sender: futures_util::stream::SplitSink<&mut WebSocketStream<TcpStream>, Message>,
+        request: &ClusterRequest,
+        addr: &SocketAddr,
+    ) -> Result<()> {
+        let response = ClusterResponse {
+            id: request.id,
+            from: *addr,
+            data: ClusterResponseData::Pong,
+        };
+        let response_text = serde_json::to_string(&response)?;
+        ws_sender.send(Message::Text(response_text)).await?;
+        Ok(())
+    }
+
+    async fn handle_update_address_request(
+        mut ws_sender: futures_util::stream::SplitSink<&mut WebSocketStream<TcpStream>, Message>,
+        request: &ClusterRequest,
+        addr: &SocketAddr,
+    ) -> Result<()> {
+        let response = ClusterResponse {
+            id: request.id,
+            from: *addr,
+            data: ClusterResponseData::AddressUpdated,
+        };
+        let response_text = serde_json::to_string(&response)?;
+        ws_sender.send(Message::Text(response_text)).await?;
+        Ok(())
+    }
+
+    async fn handle_request(
+        mut ws_sender: futures_util::stream::SplitSink<&mut WebSocketStream<TcpStream>, Message>,
+        request: ClusterRequest,
+        addr: &SocketAddr,
+    ) -> Result<()> {
+        match request.data {
+            ClusterRequestData::Ping => {
+                Self::handle_ping_request(ws_sender, &request, addr).await?;
+            }
+            ClusterRequestData::UpdateAddress(_) => {
+                Self::handle_update_address_request(ws_sender, &request, addr).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn run(state: ClusterState, socket_addr: SocketAddr) -> Result<()> {
         let mut state = state;
 
@@ -82,7 +133,6 @@ impl Cluster {
         println!("Cluster listening on {}", listener.local_addr()?);
 
         loop {
-            // Use a non-blocking select! with a timeout
             select! {
                 Some(command) = state.command_rx.recv() => {
                     match command {
@@ -100,7 +150,7 @@ impl Cluster {
                     // Process WebSocket messages
                     let mut to_remove = Vec::new();
                     for (i, (ws_stream, addr)) in state.connections.iter_mut().enumerate() {
-                        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+                        let (ws_sender, mut ws_receiver) = ws_stream.split();
 
                         match ws_receiver.next().now_or_never() {
                             Some(Some(Ok(msg))) => {
@@ -108,16 +158,8 @@ impl Cluster {
                                     if let Ok(request) =
                                         serde_json::from_str::<ClusterRequest>(msg.to_text()?)
                                     {
-                                        match request.data {
-                                            ClusterRequestData::Ping => {
-                                                let response = ClusterResponse {
-                                                    id: request.id,
-                                                    from: *addr,
-                                                    data: ClusterResponseData::Pong,
-                                                };
-                                                let response_text = serde_json::to_string(&response)?;
-                                                ws_sender.send(Message::Text(response_text)).await?;
-                                            }
+                                        if let Err(e) = Self::handle_request(ws_sender, request, addr).await {
+                                            eprintln!("Error handling request: {}", e);
                                         }
                                     }
                                 }
