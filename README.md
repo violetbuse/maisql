@@ -1,2 +1,0 @@
-# maisql
- Distributed Sqlite
