@@ -1,9 +1,10 @@
 mod db;
 use db::{Block, DatabaseManager};
 use std::path::PathBuf;
+use anyhow::Result;
 
 #[tokio::main]
-async fn main() -> rusqlite::Result<()> {
+async fn main() -> Result<()> {
     let db_manager = DatabaseManager::new();
     
     // Initialize the main database
