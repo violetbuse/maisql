@@ -12,20 +12,20 @@ pub struct Block {
 }
 
 #[derive(Clone)]
-pub struct DatabaseManager {
+pub struct DbFileManager {
     connections: Arc<Mutex<HashMap<String, Connection>>>,
 }
 
-impl DatabaseManager {
+impl DbFileManager {
     pub fn new() -> Self {
-        DatabaseManager {
+        DbFileManager {
             connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub async fn add_database(&self, name: &str, path: PathBuf) -> Result<()> {
         let conn = Connection::open(path)?;
-        
+
         // Initialize blockchain table for new connection
         conn.execute(
             "CREATE TABLE IF NOT EXISTS blockchain (
@@ -48,11 +48,11 @@ impl DatabaseManager {
         let mut connections = self.connections.lock().await;
         if let Some(conn) = connections.get_mut(db_name) {
             let tx = conn.transaction()?;
-            
+
             for block in blocks {
                 // First execute the SQL command from the block
                 tx.execute_batch(&block.command)?;
-                
+
                 // Then record the block in the blockchain table
                 tx.execute(
                     "INSERT INTO blockchain (id, previous_id, command, created_at) 
@@ -65,7 +65,7 @@ impl DatabaseManager {
                     ),
                 )?;
             }
-            
+
             tx.commit()?;
         }
         Ok(())
@@ -86,4 +86,4 @@ impl DatabaseManager {
         }
         Ok(())
     }
-} 
+}

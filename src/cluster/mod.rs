@@ -1,10 +1,12 @@
 pub mod client;
 use anyhow::Result;
+use etcd_client::Client as EtcdClient;
 use futures_util::stream::StreamExt;
 use futures_util::FutureExt;
 use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::{mpsc, oneshot};
@@ -17,13 +19,14 @@ pub struct Cluster {
     command_tx: mpsc::Sender<ClusterCommand>,
 }
 
-#[derive(Debug)]
+#[derive()]
 pub struct ClusterState {
     command_rx: mpsc::Receiver<ClusterCommand>,
     connections: Vec<(
         tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         std::net::SocketAddr,
     )>,
+    etcd_client: Arc<EtcdClient>,
 }
 
 #[derive(Debug)]
@@ -62,12 +65,13 @@ pub enum ClusterResponseData {
 }
 
 impl Cluster {
-    pub fn new(socket_addr: SocketAddr) -> Self {
+    pub fn new(socket_addr: SocketAddr, etcd_client: Arc<EtcdClient>) -> Self {
         let (command_tx, command_rx) = mpsc::channel(32);
 
         let state = ClusterState {
             command_rx,
             connections: Vec::new(),
+            etcd_client,
         };
 
         tokio::spawn(async move {
